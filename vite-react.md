@@ -1,87 +1,111 @@
 # Vite + React + TypeScript Setup
 
-Modern React application setup using Vite as the build tool and TypeScript for type safety.
+This guide explains how to structure and configure a modern React application using Vite as the build tool. Rather than just showing configuration files, it explains the reasoning behind each decision.
 
 > **Prerequisites**: See [typescript.md](./typescript.md) for TypeScript fundamentals and [react.md](./react.md) for React patterns.
 
-## Project Structure
+## Why Vite?
+
+### The Problem with Traditional Bundlers
+
+Traditional bundlers like Webpack bundle your entire application before the dev server starts. As applications grow, this process slows dramatically—sometimes taking 30+ seconds to start.
+
+Vite takes a different approach:
+- **Native ES modules in development**: The browser loads modules directly without bundling
+- **On-demand compilation**: Files are compiled only when requested
+- **Fast Hot Module Replacement**: Changes appear nearly instantly
+
+### When to Choose Vite
+
+**Vite excels for:**
+- New React/Vue/Svelte projects
+- Projects prioritizing developer experience
+- Teams comfortable with modern tooling
+
+**Consider alternatives when:**
+- You need extensive Webpack plugin ecosystem
+- Your team has existing Webpack expertise and complex configurations
+- You're working with legacy code that requires specific bundler behaviors
+
+## Project Structure Philosophy
+
+### Feature-Based Organization
+
+Organize code by feature (what it does) rather than by type (what it is):
 
 ```
-project-root/
-├── index.html              # HTML entry point
-├── package.json            # Dependencies and scripts
-├── tsconfig.json           # TypeScript config
-├── tsconfig.node.json      # TypeScript config for Vite
-├── vite.config.ts          # Vite configuration
-├── .env                    # Environment variables
-├── .env.example            # Environment template
-├── public/                 # Static assets (copied as-is)
-│   └── favicon.ico
-└── src/
-    ├── main.tsx            # Application entry
-    ├── App/                # Root component
-    │   ├── index.tsx
-    │   └── App.css
-    ├── types/              # Shared TypeScript types
-    │   ├── index.ts        # Barrel export
-    │   ├── project.ts
-    │   └── api.ts
-    ├── services/           # API service layer
-    │   ├── index.ts
-    │   ├── api.ts          # Base fetch utilities
-    │   └── projects.ts     # Project-specific API
-    ├── styles/             # Global styles
-    │   ├── global.css
-    │   └── cssModules.d.ts # CSS Modules declaration
-    └── [FeatureName]/      # Feature folders
-        ├── index.tsx
-        └── FeatureName.module.css
+src/
+├── features/
+│   ├── users/              # Everything related to users
+│   │   ├── UserList.tsx
+│   │   ├── UserDetail.tsx
+│   │   ├── UserForm.tsx
+│   │   ├── userService.ts
+│   │   ├── userTypes.ts
+│   │   └── UserList.module.css
+│   │
+│   └── articles/           # Everything related to articles
+│       ├── ArticleList.tsx
+│       ├── ArticleEditor.tsx
+│       ├── articleService.ts
+│       └── articleTypes.ts
+│
+├── shared/                 # Truly shared code
+│   ├── components/         # Reusable UI components
+│   │   ├── Button/
+│   │   ├── Modal/
+│   │   └── Form/
+│   ├── hooks/              # Shared custom hooks
+│   ├── utils/              # Pure utility functions
+│   └── types/              # Shared type definitions
+│
+├── services/               # API layer
+│   ├── api.ts              # Base fetch configuration
+│   └── index.ts
+│
+├── App.tsx                 # Root component
+└── main.tsx                # Entry point
 ```
 
-## Configuration Files
+**Why feature-based?**
 
-### package.json
+1. **Locality of behavior**: Everything related to a feature is in one place. When fixing a user bug, you're not jumping between `components/`, `services/`, `types/`, and `styles/` folders.
 
-```json
-{
-  "name": "my-app",
-  "private": true,
-  "version": "0.0.1",
-  "type": "module",
-  "scripts": {
-    "dev": "vite",
-    "build": "tsc && vite build",
-    "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
-    "preview": "vite preview",
-    "type-check": "tsc --noEmit"
-  },
-  "dependencies": {
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "react-router-dom": "^7.1.3"
-  },
-  "devDependencies": {
-    "@types/node": "^22.10.5",
-    "@types/react": "^18.3.18",
-    "@types/react-dom": "^18.3.5",
-    "@typescript-eslint/eslint-plugin": "^8.20.0",
-    "@typescript-eslint/parser": "^8.20.0",
-    "@vitejs/plugin-react": "^4.3.4",
-    "eslint": "^9.18.0",
-    "eslint-plugin-react-hooks": "^5.1.0",
-    "eslint-plugin-react-refresh": "^0.4.16",
-    "typescript": "^5.7.3",
-    "vite": "^6.0.11"
-  }
-}
+2. **Clear boundaries**: Features are self-contained. You can understand a feature by reading one directory.
+
+3. **Easier deletion**: Removing a feature means deleting one folder, not hunting through multiple directories.
+
+4. **Team scaling**: Different developers can work on different features without constant merge conflicts.
+
+### The Shared Folder
+
+Only put code in `shared/` when it's genuinely used by multiple features:
+
+```
+shared/
+├── components/     # UI primitives used across features
+│   ├── Button/     # Generic button component
+│   ├── Modal/      # Generic modal wrapper
+│   └── Input/      # Form input components
+│
+├── hooks/          # Hooks used by multiple features
+│   ├── useDebounce.ts
+│   └── useLocalStorage.ts
+│
+├── utils/          # Pure functions with no feature logic
+│   ├── formatDate.ts
+│   └── validateEmail.ts
+│
+└── types/          # Types used across features
+    ├── api.ts      # Generic API types
+    └── common.ts   # Shared domain types
 ```
 
-**Key Points**:
-- `"type": "module"` enables ES modules
-- `tsc && vite build` runs type check before building
-- Separate `type-check` script for CI pipelines
+**Rule of thumb**: Start code in a feature folder. Move to `shared/` only when a second feature needs it.
 
-### vite.config.ts
+## Configuration Deep Dive
+
+### vite.config.ts Explained
 
 ```typescript
 import { defineConfig } from 'vite'
@@ -90,24 +114,28 @@ import path from 'path'
 
 export default defineConfig({
   plugins: [react()],
+
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
     },
   },
+
   server: {
-    host: true,       // Expose to network (for Docker)
+    host: true,
     port: 5173,
     watch: {
-      usePolling: true,  // Required for Docker volume mounts
+      usePolling: true,
     },
   },
+
   css: {
     modules: {
-      localsConvention: 'camelCase',  // Convert kebab-case to camelCase
+      localsConvention: 'camelCase',
       generateScopedName: '[name]__[local]___[hash:base64:5]',
     },
   },
+
   build: {
     outDir: 'dist',
     sourcemap: true,
@@ -115,7 +143,6 @@ export default defineConfig({
       output: {
         manualChunks: {
           vendor: ['react', 'react-dom', 'react-router-dom'],
-          // Add other large libraries as separate chunks
         },
       },
     },
@@ -123,223 +150,118 @@ export default defineConfig({
 })
 ```
 
-**Key Points**:
-- `@` alias maps to `./src` for clean imports
-- `host: true` required for Docker container access
-- `usePolling: true` required for file watching in Docker
-- `manualChunks` splits vendor libraries for better caching
+**Path aliases (`@`)**:
+```typescript
+// Without alias - fragile, changes if file moves
+import { Button } from '../../../shared/components/Button'
 
-### tsconfig.json
+// With alias - stable, doesn't break when moving files
+import { Button } from '@/shared/components/Button'
+```
+
+Path aliases make imports cleaner and more maintainable. The `@` convention is widely recognized.
+
+**Server configuration**:
+- `host: true` - Exposes the server to the network, required for Docker containers
+- `usePolling: true` - Enables file watching in Docker (some filesystems don't support native watching)
+
+**CSS Modules**:
+- `localsConvention: 'camelCase'` - Converts `my-class` to `styles.myClass` in JavaScript
+- `generateScopedName` - Creates unique class names like `Button__primary___x7h2k` to prevent collisions
+
+**Build optimization**:
+- `manualChunks` - Separates vendor libraries into their own bundle. Since React/React DOM change rarely, browsers can cache them separately from your application code.
+
+### TypeScript Configuration
 
 ```json
 {
   "compilerOptions": {
     "target": "ES2020",
-    "useDefineForClassFields": true,
     "lib": ["ES2020", "DOM", "DOM.Iterable"],
     "module": "ESNext",
-    "skipLibCheck": true,
-
-    /* Bundler mode */
     "moduleResolution": "bundler",
-    "allowImportingTsExtensions": true,
-    "resolveJsonModule": true,
-    "isolatedModules": true,
-    "noEmit": true,
+
     "jsx": "react-jsx",
 
-    /* Linting */
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
 
-    /* Path aliases */
     "baseUrl": ".",
     "paths": {
       "@/*": ["./src/*"]
     }
-  },
-  "include": ["src"],
-  "references": [{ "path": "./tsconfig.node.json" }]
+  }
 }
 ```
 
-### tsconfig.node.json
+**Key decisions**:
 
-```json
-{
-  "compilerOptions": {
-    "composite": true,
-    "skipLibCheck": true,
-    "module": "ESNext",
-    "moduleResolution": "bundler",
-    "allowSyntheticDefaultImports": true
-  },
-  "include": ["vite.config.ts"]
-}
+- `moduleResolution: "bundler"` - Uses Vite's module resolution instead of Node.js rules
+- `jsx: "react-jsx"` - Uses React 17+ automatic JSX runtime (no need to import React)
+- `strict: true` - Enables all strict type checking
+- `paths` - Must mirror Vite's aliases for TypeScript to understand imports
+
+### Environment Variables
+
+Vite uses `import.meta.env` for environment variables:
+
+```bash
+# .env
+VITE_API_URL=http://localhost:8000
+VITE_FEATURE_FLAG_NEW_UI=true
 ```
-
-### index.html
-
-```html
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>My App</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
-  </body>
-</html>
-```
-
-## Application Entry
-
-### src/main.tsx
 
 ```typescript
-import { StrictMode } from 'react'
-import { createRoot } from 'react-dom/client'
-import App from './App'
-import './styles/global.css'
-
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-)
+// Access in code
+const apiUrl = import.meta.env.VITE_API_URL;
+const showNewUI = import.meta.env.VITE_FEATURE_FLAG_NEW_UI === 'true';
 ```
 
-**Key Points**:
-- `!` non-null assertion for `getElementById` result
-- `StrictMode` enables additional development checks
-- Global CSS imported at entry point
+**Important constraints**:
+- Only `VITE_` prefixed variables are exposed to the client
+- Variables are embedded at build time, not runtime
+- Never put secrets in `VITE_` variables—they're visible in the browser
 
-## Type Definitions
-
-### src/types/project.ts
+**Type safety for environment variables**:
 
 ```typescript
-export interface Project {
-  id: string
-  name: string
-  summary?: string
-  status: ProjectStatus
-  created_at: string
-  updated_at: string
-  archived_at?: string
+// src/vite-env.d.ts
+/// <reference types="vite/client" />
+
+interface ImportMetaEnv {
+  readonly VITE_API_URL: string;
+  readonly VITE_FEATURE_FLAG_NEW_UI: string;
 }
 
-export enum ProjectStatus {
-  Active = 'active',
-  OnHold = 'on_hold',
-  Archived = 'archived',
-}
-
-export interface CreateProjectRequest {
-  name: string
-  summary?: string
-}
-
-export interface UpdateProjectRequest {
-  name: string
-  summary?: string
-  status?: ProjectStatus
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
 }
 ```
 
-### src/types/api.ts
+## The Service Layer Pattern
+
+### Why Isolate API Calls?
+
+Putting fetch calls directly in components creates problems:
+
+1. **Duplication**: Multiple components fetching the same data differently
+2. **Inconsistency**: Each component handles errors differently
+3. **Testing difficulty**: Can't mock API calls without mocking fetch globally
+4. **Type safety**: No central place to define API contracts
+
+### Service Layer Structure
 
 ```typescript
-export interface ApiError {
-  error: string
-}
-
-export interface ApiResponse<T> {
-  data?: T
-  error?: string
-}
-```
-
-### src/types/index.ts (Barrel Export)
-
-```typescript
-export * from './project'
-export * from './api'
-```
-
-## CSS Modules
-
-### src/styles/cssModules.d.ts
-
-TypeScript declaration for CSS Modules.
-
-```typescript
-declare module '*.module.css' {
-  const classes: { [key: string]: string }
-  export default classes
-}
-```
-
-### Component CSS Module
-
-```css
-/* src/ProjectCard/ProjectCard.module.css */
-.container {
-  padding: 1rem;
-  border-radius: 8px;
-  background: var(--surface);
-}
-
-.title {
-  font-size: 1.25rem;
-  font-weight: 600;
-  margin-bottom: 0.5rem;
-}
-
-.summary {
-  color: var(--text-secondary);
-  font-size: 0.875rem;
-}
-```
-
-### Using CSS Modules
-
-```typescript
-import styles from './ProjectCard.module.css'
-
-interface ProjectCardProps {
-  project: Project
-}
-
-export default function ProjectCard({ project }: ProjectCardProps) {
-  return (
-    <div className={styles.container}>
-      <h3 className={styles.title}>{project.name}</h3>
-      <p className={styles.summary}>{project.summary}</p>
-    </div>
-  )
-}
-```
-
-## Service Layer
-
-### src/services/api.ts
-
-Base API utilities with error handling.
-
-```typescript
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+// services/api.ts - Base configuration
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
-    super(message)
-    this.name = 'ApiError'
+    super(message);
+    this.name = 'ApiError';
   }
 }
 
@@ -347,386 +269,296 @@ export async function fetchApi<T>(
   endpoint: string,
   options?: RequestInit
 ): Promise<T> {
-  const url = `${API_URL}${endpoint}`
+  const response = await fetch(`${API_URL}${endpoint}`, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...options?.headers,
+    },
+  });
 
-  try {
-    const response = await fetch(url, {
-      ...options,
-      headers: {
-        'Content-Type': 'application/json',
-        ...options?.headers,
-      },
-      credentials: 'include',
-    })
-
-    if (!response.ok) {
-      throw new ApiError(
-        response.status,
-        `API Error: ${response.statusText}`
-      )
-    }
-
-    return await response.json()
-  } catch (error) {
-    if (error instanceof ApiError) {
-      throw error
-    }
-    console.error('API Error:', error)
-    throw new Error('Network error occurred')
+  if (!response.ok) {
+    throw new ApiError(response.status, `API Error: ${response.statusText}`);
   }
-}
 
-export async function fetchApiNoResponse(
-  endpoint: string,
-  options?: RequestInit
-): Promise<void> {
-  const url = `${API_URL}${endpoint}`
-
-  try {
-    const response = await fetch(url, {
-      ...options,
-      headers: {
-        'Content-Type': 'application/json',
-        ...options?.headers,
-      },
-      credentials: 'include',
-    })
-
-    if (!response.ok) {
-      throw new ApiError(
-        response.status,
-        `API Error: ${response.statusText}`
-      )
-    }
-  } catch (error) {
-    if (error instanceof ApiError) {
-      throw error
-    }
-    console.error('API Error:', error)
-    throw new Error('Network error occurred')
-  }
+  return response.json();
 }
 ```
 
-### src/services/projects.ts
-
-Feature-specific service.
-
 ```typescript
-import { fetchApi, fetchApiNoResponse } from '@/services/api'
-import type {
-  Project,
-  CreateProjectRequest,
-  UpdateProjectRequest
-} from '@/types'
+// features/users/userService.ts - Feature-specific API
+import { fetchApi } from '@/services/api';
+import type { User, CreateUserInput, UpdateUserInput } from './userTypes';
 
-export const projectsService = {
-  list: async (): Promise<Project[]> => {
-    return fetchApi<Project[]>('/projects')
-  },
+export const userService = {
+  getAll: () => fetchApi<User[]>('/users'),
 
-  get: async (id: string): Promise<Project> => {
-    return fetchApi<Project>(`/projects/${id}`)
-  },
+  getById: (id: string) => fetchApi<User>(`/users/${id}`),
 
-  create: async (data: CreateProjectRequest): Promise<Project> => {
-    return fetchApi<Project>('/projects', {
+  create: (data: CreateUserInput) =>
+    fetchApi<User>('/users', {
       method: 'POST',
       body: JSON.stringify(data),
-    })
-  },
+    }),
 
-  update: async (id: string, data: UpdateProjectRequest): Promise<Project> => {
-    return fetchApi<Project>(`/projects/${id}`, {
+  update: (id: string, data: UpdateUserInput) =>
+    fetchApi<User>(`/users/${id}`, {
       method: 'PUT',
       body: JSON.stringify(data),
-    })
-  },
+    }),
 
-  delete: async (id: string): Promise<void> => {
-    return fetchApiNoResponse(`/projects/${id}`, {
-      method: 'DELETE',
-    })
-  },
+  delete: (id: string) =>
+    fetchApi<void>(`/users/${id}`, { method: 'DELETE' }),
+};
+```
+
+**Benefits**:
+- All API calls are typed
+- Error handling is consistent
+- Easy to mock for testing
+- API changes affect one file, not every component
+
+## CSS Modules
+
+### Why CSS Modules?
+
+Traditional CSS has a global namespace problem:
+
+```css
+/* styles.css */
+.button { background: blue; }
+
+/* another-styles.css */
+.button { background: red; }  /* Conflicts! */
+```
+
+CSS Modules solve this by scoping class names to the component:
+
+```css
+/* Button.module.css */
+.button {
+  background: blue;
 }
 ```
 
-## React Components with TypeScript
+```typescript
+// Button.tsx
+import styles from './Button.module.css';
 
-### Component with Props Interface
+// styles.button becomes something like "Button_button__x7h2k"
+export function Button() {
+  return <button className={styles.button}>Click me</button>;
+}
+```
+
+### Declaration File for TypeScript
+
+TypeScript doesn't understand CSS imports by default:
 
 ```typescript
-import styles from './ProjectCard.module.css'
-import type { Project } from '@/types'
+// src/styles/cssModules.d.ts
+declare module '*.module.css' {
+  const classes: { [key: string]: string };
+  export default classes;
+}
+```
 
-interface ProjectCardProps {
-  project: Project
-  onClick?: (project: Project) => void
+This tells TypeScript that CSS Module imports are objects with string values.
+
+### Organizing Styles
+
+Keep styles next to components:
+
+```
+features/users/
+├── UserCard.tsx
+├── UserCard.module.css    # Styles for UserCard only
+├── UserList.tsx
+└── UserList.module.css    # Styles for UserList only
+```
+
+For global styles (resets, variables, typography):
+
+```
+src/
+├── styles/
+│   ├── global.css         # Reset, base styles
+│   ├── variables.css      # CSS custom properties
+│   └── cssModules.d.ts    # TypeScript declaration
+└── main.tsx               # Import global.css here
+```
+
+## Component Patterns
+
+### Typing Component Props
+
+```typescript
+// Explicit interface for props
+interface UserCardProps {
+  user: User;
+  onSelect?: (user: User) => void;
+  highlighted?: boolean;
 }
 
-export default function ProjectCard({ project, onClick }: ProjectCardProps) {
+export function UserCard({ user, onSelect, highlighted = false }: UserCardProps) {
   return (
     <div
-      className={styles.container}
-      onClick={() => onClick?.(project)}
+      className={highlighted ? styles.highlighted : styles.card}
+      onClick={() => onSelect?.(user)}
     >
-      <h3 className={styles.title}>{project.name}</h3>
-      <p className={styles.summary}>{project.summary}</p>
+      <h3>{user.name}</h3>
+      <p>{user.email}</p>
     </div>
-  )
+  );
 }
 ```
 
-### Component with State
+**Why explicit interfaces?**
+- Self-documenting: Props interface shows what the component accepts
+- Better error messages: TypeScript errors reference the interface
+- Refactoring support: IDE can rename props across usages
+
+### Children Props
 
 ```typescript
-import { useState } from 'react'
-import type { CreateProjectRequest } from '@/types'
-
-interface CreateFormProps {
-  onSubmit: (data: CreateProjectRequest) => Promise<void>
-  onCancel: () => void
+interface CardProps {
+  title: string;
+  children: React.ReactNode;  // Any valid React child
 }
 
-export default function CreateForm({ onSubmit, onCancel }: CreateFormProps) {
-  const [formData, setFormData] = useState<CreateProjectRequest>({
-    name: '',
-    summary: '',
-  })
-  const [isSubmitting, setIsSubmitting] = useState(false)
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
-    setIsSubmitting(true)
-    try {
-      await onSubmit(formData)
-    } finally {
-      setIsSubmitting(false)
-    }
-  }
-
+export function Card({ title, children }: CardProps) {
   return (
-    <form onSubmit={handleSubmit}>
-      <input
-        type="text"
-        value={formData.name}
-        onChange={(e) => setFormData(prev => ({ ...prev, name: e.target.value }))}
-        placeholder="Project name"
-        required
-      />
-      <textarea
-        value={formData.summary || ''}
-        onChange={(e) => setFormData(prev => ({ ...prev, summary: e.target.value }))}
-        placeholder="Summary"
-      />
-      <button type="submit" disabled={isSubmitting}>
-        {isSubmitting ? 'Creating...' : 'Create'}
-      </button>
-      <button type="button" onClick={onCancel}>
-        Cancel
-      </button>
-    </form>
-  )
+    <div className={styles.card}>
+      <h2>{title}</h2>
+      <div className={styles.content}>{children}</div>
+    </div>
+  );
 }
 ```
 
-### Component with Route Parameters
+### Event Handler Types
 
 ```typescript
-import { useParams, useNavigate } from 'react-router-dom'
-import { useState, useEffect } from 'react'
-import { projectsService } from '@/services/projects'
-import type { Project } from '@/types'
+interface FormProps {
+  onSubmit: (data: FormData) => void;
+}
 
-export default function ProjectDetailPage() {
-  const { id } = useParams<{ id: string }>()
-  const navigate = useNavigate()
-  const [project, setProject] = useState<Project | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+export function Form({ onSubmit }: FormProps) {
+  const handleSubmit = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    // ... gather form data
+    onSubmit(data);
+  };
+
+  const handleChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    // event.target.value is typed as string
+  };
+
+  return <form onSubmit={handleSubmit}>...</form>;
+}
+```
+
+## Data Fetching Patterns
+
+### Basic Pattern with useState/useEffect
+
+For simple cases:
+
+```typescript
+function UserDetail({ userId }: { userId: string }) {
+  const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    async function fetchProject() {
-      if (!id) return
+    let cancelled = false;
 
+    async function fetchUser() {
       try {
-        setLoading(true)
-        setError(null)
-        const data = await projectsService.get(id)
-        setProject(data)
+        setLoading(true);
+        setError(null);
+        const data = await userService.getById(userId);
+        if (!cancelled) {
+          setUser(data);
+        }
       } catch (err) {
-        setError('Failed to load project')
-        console.error(err)
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : 'Failed to load');
+        }
       } finally {
-        setLoading(false)
+        if (!cancelled) {
+          setLoading(false);
+        }
       }
     }
 
-    fetchProject()
-  }, [id])
+    fetchUser();
 
-  if (loading) return <div>Loading...</div>
-  if (error) return <div>{error}</div>
-  if (!project) return <div>Project not found</div>
+    return () => {
+      cancelled = true;  // Prevent state updates if component unmounts
+    };
+  }, [userId]);
 
-  return (
-    <div>
-      <h1>{project.name}</h1>
-      <p>{project.summary}</p>
-    </div>
-  )
+  if (loading) return <LoadingSpinner />;
+  if (error) return <ErrorMessage message={error} />;
+  if (!user) return <NotFound />;
+
+  return <UserProfile user={user} />;
 }
 ```
 
-## React Query Integration
+### When to Use React Query
 
-For more complex data fetching, use TanStack Query.
-
-### Setup
+For complex data fetching needs, consider TanStack Query (React Query):
 
 ```typescript
-// src/App/index.tsx
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { BrowserRouter, Routes, Route } from 'react-router-dom'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 
-const queryClient = new QueryClient()
+function UserDetail({ userId }: { userId: string }) {
+  const queryClient = useQueryClient();
 
-export default function App() {
-  return (
-    <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
-        <Routes>
-          {/* routes */}
-        </Routes>
-      </BrowserRouter>
-    </QueryClientProvider>
-  )
-}
-```
+  // Fetch with caching, refetching, error handling
+  const { data: user, isLoading, error } = useQuery({
+    queryKey: ['users', userId],
+    queryFn: () => userService.getById(userId),
+  });
 
-### Using Queries
-
-```typescript
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { useParams } from 'react-router-dom'
-import { projectsService } from '@/services/projects'
-import type { UpdateProjectRequest } from '@/types'
-
-export default function ProjectDetailPage() {
-  const { id } = useParams<{ id: string }>()
-  const queryClient = useQueryClient()
-
-  // Fetch project
-  const { data: project, isLoading, error } = useQuery({
-    queryKey: ['projects', id],
-    queryFn: () => projectsService.get(id!),
-    enabled: !!id,  // Only fetch when id exists
-  })
-
-  // Update mutation
+  // Mutation with cache invalidation
   const updateMutation = useMutation({
-    mutationFn: (data: UpdateProjectRequest) =>
-      projectsService.update(id!, data),
+    mutationFn: (data: UpdateUserInput) => userService.update(userId, data),
     onSuccess: () => {
-      // Invalidate and refetch
-      queryClient.invalidateQueries({ queryKey: ['projects', id] })
-      queryClient.invalidateQueries({ queryKey: ['projects'] })
+      queryClient.invalidateQueries({ queryKey: ['users', userId] });
     },
-  })
+  });
 
-  if (isLoading) return <div>Loading...</div>
-  if (error) return <div>Error loading project</div>
-  if (!project) return <div>Project not found</div>
-
-  return (
-    <div>
-      <h1>{project.name}</h1>
-      <button
-        onClick={() => updateMutation.mutate({
-          name: project.name,
-          status: 'archived'
-        })}
-        disabled={updateMutation.isPending}
-      >
-        Archive
-      </button>
-    </div>
-  )
+  // ...
 }
 ```
 
-## Environment Variables
+**Choose React Query when you need:**
+- Automatic caching and background refetching
+- Optimistic updates
+- Request deduplication
+- Pagination or infinite scroll
+- Complex loading states across components
 
-### .env
+## Best Practices Summary
 
-```bash
-VITE_API_URL=http://localhost:8000
-```
+### Project Organization
 
-### .env.example
+1. **Feature-based structure** - Group related code together by what it does
+2. **Shared folder is earned** - Code starts in features, moves to shared when genuinely reused
+3. **Flat over nested** - Avoid deep nesting; 2-3 levels is usually enough
 
-```bash
-VITE_API_URL=http://localhost:8000
-```
+### Configuration
 
-### Usage in Code
+4. **Path aliases** - Use `@/` for cleaner, more stable imports
+5. **Type environment variables** - Define `ImportMetaEnv` for type safety
+6. **Separate vendor chunks** - Better caching for libraries that change rarely
 
-```typescript
-// Access environment variables
-const apiUrl = import.meta.env.VITE_API_URL
+### Code Patterns
 
-// Type-safe environment (add to src/vite-env.d.ts)
-interface ImportMetaEnv {
-  readonly VITE_API_URL: string
-}
-```
-
-**Key Points**:
-- Only `VITE_` prefixed variables are exposed to client
-- Access via `import.meta.env.VITE_*`
-- Never commit `.env` with secrets
-- Use `.env.example` as template
-
-## Best Practices
-
-### Component Organization
-
-1. **One component per file** - Export as default
-2. **Co-locate styles** - CSS Module next to component
-3. **Co-locate types** - Component-specific types in same file
-4. **Shared types in /types** - Reusable types in dedicated folder
-
-### TypeScript Patterns
-
-1. **Use interfaces for props** - Clear contract for components
-2. **Type event handlers** - `React.FormEvent`, `React.MouseEvent`
-3. **Use generics sparingly** - Only when truly needed
-4. **Prefer type imports** - `import type { X }` for types only
-
-### File Naming
-
-- **Components**: `index.tsx` in named folder (`ProjectCard/index.tsx`)
-- **Services**: `featurename.ts` in services folder
-- **Types**: `featurename.ts` in types folder
-- **CSS Modules**: `ComponentName.module.css`
-
-### Import Order
-
-```typescript
-// 1. React and third-party
-import { useState, useEffect } from 'react'
-import { useParams } from 'react-router-dom'
-import { useQuery } from '@tanstack/react-query'
-
-// 2. Internal services/utils
-import { projectsService } from '@/services/projects'
-
-// 3. Types
-import type { Project } from '@/types'
-
-// 4. Components
-import ProjectCard from '../ProjectCard'
-
-// 5. Styles
-import styles from './ProjectList.module.css'
-```
+7. **Service layer** - Isolate API calls from components
+8. **CSS Modules** - Scoped styles prevent global conflicts
+9. **Explicit prop interfaces** - Document component contracts
+10. **Handle all states** - Loading, error, empty, and success states in data fetching

@@ -1,1152 +1,593 @@
 # Go API with PostgreSQL and Docker
 
-Complete guide for building a REST API in Go using gorilla/mux, PostgreSQL database, and Docker containerization.
+This guide explains how to build and deploy a Go REST API with PostgreSQL, covering architectural decisions from project structure to production deployment.
 
-> **Prerequisites**: See [golang.md](./golang.md), [postgres.md](./postgres.md), and [docker.md](./docker.md) for individual technology details.
+> **Prerequisites**: See [golang.md](./golang.md) for Go patterns and [postgres.md](./postgres.md) for database patterns.
 
-## Project Structure
+## Architecture Overview
+
+### The Full Stack
 
 ```
-project-root/
-├── main.go                 # Application entry point
-├── go.mod                  # Go module definition
-├── go.sum                  # Dependency checksums
-├── Dockerfile              # Production build
-├── Dockerfile.dev          # Development with hot reload
-├── docker-compose.yaml     # Service orchestration
-├── .air.toml               # Air hot reload config
-├── .env                    # Environment variables
-├── .gitignore
-├── migrations/             # Database migrations
-│   ├── 000001_init_schema.up.sql
-│   ├── 000001_init_schema.down.sql
-│   ├── 000002_create_projects.up.sql
-│   └── 000002_create_projects.down.sql
+┌─────────────────────────────────────────────────────────────┐
+│                        Docker Compose                        │
+│  ┌─────────────────┐           ┌─────────────────────────┐  │
+│  │   PostgreSQL    │◄─────────►│         Go API          │  │
+│  │                 │           │                         │  │
+│  │  - Data storage │           │  - HTTP handlers        │  │
+│  │  - Transactions │           │  - Business logic       │  │
+│  │  - Migrations   │           │  - Data access          │  │
+│  └─────────────────┘           └─────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Why these components together?**
+
+- **Go**: Fast, compiles to a single binary, excellent concurrency
+- **PostgreSQL**: Mature, reliable, rich feature set
+- **Docker Compose**: Reproducible environments, easy local development
+
+## Project Structure Decisions
+
+### Organizing Go Code
+
+```
+myapi/
+├── main.go                 # Minimal - just wiring
+├── go.mod
 └── pkg/
-    ├── database/           # Database connection
-    │   └── database.go
-    ├── errors/             # Error utilities
-    │   └── errors.go
-    ├── handlers/           # HTTP handlers
-    │   ├── health.go
-    │   ├── projects.go
-    │   └── response.go
-    ├── middleware/         # HTTP middleware
-    │   ├── logger.go
-    │   └── cors.go
-    ├── models/             # Data models
-    │   ├── project.go
-    │   └── errors.go
-    ├── repository/         # Data access layer
-    │   └── project.go
-    ├── router/             # Route configuration
-    │   └── router.go
-    └── server/             # HTTP server setup
-        └── server.go
+    ├── server/             # HTTP server lifecycle
+    ├── router/             # Route definitions
+    ├── handlers/           # Request/response handling
+    ├── middleware/         # Cross-cutting concerns
+    ├── models/             # Domain types
+    ├── repository/         # Data access
+    ├── database/           # Connection management
+    └── errors/             # Error utilities
 ```
 
-## Module Setup
+### Why pkg/?
 
-### go.mod
+Go has two conventions for non-main code:
+- `internal/` - Cannot be imported by other projects
+- `pkg/` - Can be imported by other projects
+
+Use `pkg/` when your code might be useful as a library. Use `internal/` for truly internal code. For most APIs, either works; the structure matters more than the folder name.
+
+### The Dependency Flow
+
+```
+main.go
+    ↓
+server (starts HTTP server)
+    ↓
+router (defines routes, wires handlers)
+    ↓
+handlers (HTTP in/out)
+    ↓
+repository (data access)
+    ↓
+database (connection pool)
+```
+
+**The rule**: Dependencies flow downward. A handler can use a repository, but a repository should never import a handler.
+
+**Why this matters**:
+- Clear mental model of what depends on what
+- Easy to test each layer in isolation
+- Changes in one layer don't ripple unexpectedly
+
+## The Database Connection
+
+### Connection Pool Configuration
+
+Go's `database/sql` maintains a connection pool. Configure it for your workload:
 
 ```go
-module github.com/username/myapi
+func NewDatabase(dsn string) (*sql.DB, error) {
+    db, err := sql.Open("postgres", dsn)
+    if err != nil {
+        return nil, err
+    }
 
-go 1.21
+    // Tune for your workload
+    db.SetMaxOpenConns(25)         // Max connections to database
+    db.SetMaxIdleConns(10)         // Connections to keep ready
+    db.SetConnMaxLifetime(5 * time.Minute)  // Recycle connections
 
-require (
-	github.com/gorilla/mux v1.8.1
-	github.com/lib/pq v1.10.9
-)
+    // Verify connection works
+    if err := db.Ping(); err != nil {
+        return nil, err
+    }
+
+    return db, nil
+}
 ```
+
+**Sizing the pool**:
+
+- **MaxOpenConns**: Start with 25, monitor for connection wait times
+- **MaxIdleConns**: Usually 25-50% of MaxOpenConns
+- **ConnMaxLifetime**: Shorter than PostgreSQL's `idle_in_transaction_session_timeout`
+
+### Handling Container Startup
+
+In Docker Compose, the API container might start before PostgreSQL is ready. Handle this with retries:
+
+```go
+func ConnectWithRetry(dsn string, maxAttempts int) (*sql.DB, error) {
+    var db *sql.DB
+    var err error
+
+    for i := 0; i < maxAttempts; i++ {
+        db, err = NewDatabase(dsn)
+        if err == nil {
+            return db, nil
+        }
+
+        log.Printf("Database connection attempt %d failed: %v", i+1, err)
+        time.Sleep(time.Duration(i+1) * time.Second)
+    }
+
+    return nil, fmt.Errorf("failed after %d attempts: %w", maxAttempts, err)
+}
+```
+
+**Why not use Docker's depends_on?**
+
+`depends_on` waits for the container to start, not for the service to be ready. PostgreSQL might take several seconds after container start to accept connections.
 
 ## Docker Configuration
 
-### Dockerfile (Production)
+### Development: Hot Reload
 
-Multi-stage build for minimal production image.
-
-```dockerfile
-FROM golang:alpine as build
-RUN apk add --no-cache gcc musl-dev
-WORKDIR /app
-COPY main.go main.go
-COPY pkg/ pkg/
-COPY go.mod go.mod
-COPY go.sum go.sum
-RUN go mod download
-RUN GOOS=linux GOARCH=amd64 CGO_ENABLED=1 go build -o bin/api main.go
-
-FROM alpine:latest as release
-RUN apk --no-cache add ca-certificates
-WORKDIR /app
-COPY --from=build /app/bin ./bin
-ENTRYPOINT ./bin/api
-```
-
-**Key Points**:
-- **Build stage**: Full Go toolchain with CGO support
-- **Release stage**: Minimal Alpine with only binary
-- `CGO_ENABLED=1` for PostgreSQL driver compatibility
-- `ca-certificates` for HTTPS connections
-
-### Dockerfile.dev (Development)
-
-Development container with hot reload using Air.
+For development, we want code changes to take effect immediately without rebuilding:
 
 ```dockerfile
-FROM golang:alpine
+# Dockerfile.dev
+FROM golang:1.21-alpine
 WORKDIR /app
-ENV GO111MODULE=on
-# Install Air for hot-reload
+
+# Install air for hot reload
 RUN go install github.com/air-verse/air@latest
-COPY main.go .
-COPY pkg/ pkg/
-COPY go.sum go.sum
-COPY go.mod go.mod
+
+# Copy go.mod first for layer caching
+COPY go.mod go.sum ./
 RUN go mod download
-ENTRYPOINT air
+
+# Copy source code
+COPY . .
+
+# Air watches for changes and rebuilds
+ENTRYPOINT ["air"]
 ```
 
-### .air.toml
+**How Air works**:
 
-Air configuration for hot reload.
+1. Watches `.go` files for changes
+2. Rebuilds the binary when changes detected
+3. Restarts the running process
 
-```toml
-root = "."
-testdata_dir = "testdata"
-tmp_dir = "tmp"
-
-[build]
-  args_bin = []
-  bin = "./tmp/main"
-  cmd = "go build -o ./tmp/main ."
-  delay = 1000
-  exclude_dir = ["assets", "tmp", "vendor", "testdata"]
-  exclude_file = []
-  exclude_regex = ["_test.go"]
-  exclude_unchanged = false
-  follow_symlink = false
-  full_bin = ""
-  include_dir = []
-  include_ext = ["go", "tpl", "tmpl", "html"]
-  include_file = []
-  kill_delay = "0s"
-  log = "build-errors.log"
-  poll = false
-  poll_interval = 0
-  rerun = false
-  rerun_delay = 500
-  send_interrupt = false
-  stop_on_error = false
-
-[color]
-  app = ""
-  build = "yellow"
-  main = "magenta"
-  runner = "green"
-  watcher = "cyan"
-
-[log]
-  main_only = false
-  time = false
-
-[misc]
-  clean_on_exit = false
-
-[screen]
-  clear_on_rebuild = false
-  keep_scroll = true
-```
-
-### docker-compose.yaml
-
-Complete orchestration with PostgreSQL.
+**Volume mounts enable the workflow**:
 
 ```yaml
-x-db-variables: &db-variables
+volumes:
+  - ./main.go:/app/main.go
+  - ./pkg:/app/pkg
+```
+
+When you edit code locally, the change appears in the container, Air detects it, and your server restarts with the new code.
+
+### Production: Multi-Stage Build
+
+Production images should be minimal:
+
+```dockerfile
+# Stage 1: Build
+FROM golang:1.21-alpine AS build
+RUN apk add --no-cache gcc musl-dev  # For CGO if needed
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /api main.go
+
+# Stage 2: Runtime
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates  # For HTTPS
+WORKDIR /app
+
+COPY --from=build /api .
+
+ENTRYPOINT ["./api"]
+```
+
+**Why two stages?**
+
+| | Build Stage | Final Image |
+|---|---|---|
+| Go compiler | Yes | No |
+| Source code | Yes | No |
+| go.mod/sum | Yes | No |
+| Test files | Yes | No |
+| Binary | Generated | Copied |
+| Image size | ~800MB | ~15MB |
+
+**CGO considerations**:
+
+- `CGO_ENABLED=0` builds a pure Go binary (no C dependencies)
+- Some packages require CGO (e.g., some database drivers)
+- If you need CGO, use `golang:alpine` with `apk add gcc musl-dev`
+
+## Docker Compose Setup
+
+### Service Configuration
+
+```yaml
+x-db-env: &db-env
   POSTGRES_HOST: postgres
+  POSTGRES_PORT: 5432
   POSTGRES_USER: ${POSTGRES_USER}
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
   POSTGRES_DB: ${POSTGRES_DB}
-  POSTGRES_PORT: 5432
-
-x-api-variables: &api-variables
-  <<: *db-variables
-  PORT: 8000
-  ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
-
-networks:
-  local:
 
 services:
   postgres:
-    image: postgres:15.3-alpine
-    restart: always
+    image: postgres:15-alpine
     environment:
-      <<: *db-variables
-    hostname: postgres
-    networks:
-      local:
-        aliases:
-          - postgres
-    ports:
-      - 5432:5432
+      <<: *db-env
     volumes:
-      - ./postgres:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend
 
-  dev:
+  api:
     build:
       context: .
-      dockerfile: ./Dockerfile.dev
+      dockerfile: Dockerfile.dev
     environment:
-      <<: *api-variables
+      <<: *db-env
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
     depends_on:
       - postgres
-    networks:
-      local:
     ports:
-      - 8000:8000
+      - "8000:8000"
     volumes:
-      - ./pkg:/app/pkg
       - ./main.go:/app/main.go
-
-  release:
-    build:
-      context: .
-      dockerfile: ./Dockerfile
-    environment:
-      <<: *api-variables
-      PORT: 80
-    depends_on:
-      - postgres
+      - ./pkg:/app/pkg
     networks:
-      local:
-    ports:
-      - 8080:80
+      - backend
+
+networks:
+  backend:
 
 volumes:
-  postgres:
-    driver: local
+  postgres_data:
 ```
 
-**Key Points**:
-- YAML anchors reduce environment variable duplication
-- `depends_on` ensures postgres starts before API
-- Shared `local` network for inter-service communication
-- Volume mounts for hot reload in development
-- Persistent volume for PostgreSQL data
+### YAML Anchors Explained
 
-### .env
+```yaml
+x-db-env: &db-env    # Define anchor
+  POSTGRES_HOST: postgres
+
+environment:
+  <<: *db-env        # Insert all values from anchor
+  EXTRA_VAR: value   # Add more values
+```
+
+**Why anchors?**
+- Define database credentials once
+- Use them in both postgres and api services
+- Change in one place updates everywhere
+
+### Networks and Service Discovery
+
+Services on the same Docker network can reach each other by name:
+
+```yaml
+networks:
+  backend:   # Creates an isolated network
+
+services:
+  postgres:
+    networks:
+      - backend   # Connected to backend network
+
+  api:
+    networks:
+      - backend   # Also connected to backend network
+```
+
+The API can connect to `postgres:5432` because Docker's internal DNS resolves `postgres` to the container's IP.
+
+### Data Persistence
+
+```yaml
+volumes:
+  postgres_data:   # Named volume for database files
+
+services:
+  postgres:
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+```
+
+**Why named volumes?**
+
+Without volumes, database data lives inside the container and is lost when the container is removed.
+
+Named volumes:
+- Persist across container restarts
+- Are managed by Docker
+- Can be backed up and migrated
+
+## Environment Configuration
+
+### Separation of Concerns
 
 ```bash
-POSTGRES_USER=myapi_user
-POSTGRES_PASSWORD=myapi_password
-POSTGRES_DB=myapi_db
-ALLOWED_ORIGINS=http://localhost:5173,http://localhost:3000
-PORT=8000
+# .env file
+POSTGRES_USER=myapp
+POSTGRES_PASSWORD=secretpassword
+POSTGRES_DB=myapp_development
+ALLOWED_ORIGINS=http://localhost:3000,http://localhost:5173
 ```
 
-### .gitignore
+**Never commit .env with real credentials.** Use `.env.example` as a template:
 
-```
-# Binaries
-bin/
-tmp/
-
-# Dependencies
-vendor/
-
-# IDE
-.idea/
-.vscode/
-
-# Environment
-.env
-.env.local
-
-# Database
-postgres/
-
-# Logs
-*.log
+```bash
+# .env.example
+POSTGRES_USER=myapp
+POSTGRES_PASSWORD=changeme
+POSTGRES_DB=myapp_development
+ALLOWED_ORIGINS=http://localhost:3000
 ```
 
-## Application Code
+### Environment in the Application
 
-### main.go
+Read environment variables in Go:
 
 ```go
-package main
-
-import (
-	"log"
-	"os"
-
-	"github.com/username/myapi/pkg/database"
-	"github.com/username/myapi/pkg/server"
-)
-
-func main() {
-	// Get port from environment
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8000"
-	}
-
-	// Connect to database
-	db, err := database.NewFromEnv()
-	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
-	}
-	defer db.Close()
-
-	log.Println("Connected to database")
-
-	// Create and start server
-	srv, err := server.New(port, db.DB)
-	if err != nil {
-		log.Fatalf("Failed to create server: %v", err)
-	}
-
-	log.Printf("Starting server on port %s", port)
-	if err := srv.Start(); err != nil {
-		log.Fatalf("Server error: %v", err)
-	}
-}
-```
-
-### pkg/database/database.go
-
-```go
-package database
-
-import (
-	"database/sql"
-	"fmt"
-	"os"
-	"time"
-
-	"github.com/username/myapi/pkg/errors"
-	_ "github.com/lib/pq"
-)
-
 type Config struct {
-	Host     string
-	Port     string
-	User     string
-	Password string
-	DBName   string
+    DatabaseURL    string
+    AllowedOrigins []string
+    Port           string
 }
 
-type DB struct {
-	*sql.DB
-}
+func LoadConfig() (*Config, error) {
+    port := os.Getenv("PORT")
+    if port == "" {
+        port = "8000"  // Default
+    }
 
-func New(cfg Config) (*DB, error) {
-	connStr := fmt.Sprintf(
-		"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
-		cfg.Host, cfg.Port, cfg.User, cfg.Password, cfg.DBName,
-	)
+    origins := strings.Split(os.Getenv("ALLOWED_ORIGINS"), ",")
 
-	db, err := sql.Open("postgres", connStr)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to open database connection")
-	}
-
-	// Configure connection pool
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(25)
-	db.SetConnMaxLifetime(5 * time.Minute)
-
-	// Verify connection with retries
-	maxRetries := 5
-	var lastErr error
-	for i := 0; i < maxRetries; i++ {
-		if err := db.Ping(); err == nil {
-			return &DB{db}, nil
-		} else {
-			lastErr = err
-		}
-		if i < maxRetries-1 {
-			time.Sleep(2 * time.Second)
-		}
-	}
-
-	return nil, errors.Wrap(lastErr, "failed to ping database after retries")
-}
-
-func NewFromEnv() (*DB, error) {
-	cfg := Config{
-		Host:     os.Getenv("POSTGRES_HOST"),
-		Port:     os.Getenv("POSTGRES_PORT"),
-		User:     os.Getenv("POSTGRES_USER"),
-		Password: os.Getenv("POSTGRES_PASSWORD"),
-		DBName:   os.Getenv("POSTGRES_DB"),
-	}
-
-	if cfg.Port == "" {
-		cfg.Port = "5432"
-	}
-
-	if cfg.Host == "" || cfg.User == "" || cfg.Password == "" || cfg.DBName == "" {
-		return nil, errors.New("missing required database configuration")
-	}
-
-	return New(cfg)
-}
-
-func (db *DB) Close() error {
-	if db == nil || db.DB == nil {
-		return nil
-	}
-	return db.DB.Close()
+    return &Config{
+        DatabaseURL:    buildDSN(),
+        AllowedOrigins: origins,
+        Port:           port,
+    }, nil
 }
 ```
 
-### pkg/server/server.go
-
-```go
-package server
-
-import (
-	"context"
-	"database/sql"
-	"fmt"
-	"net/http"
-	"os"
-	"os/signal"
-	"syscall"
-	"time"
-
-	"github.com/username/myapi/pkg/errors"
-	"github.com/username/myapi/pkg/router"
-)
-
-type Server struct {
-	httpServer *http.Server
-	port       string
-	db         *sql.DB
-}
-
-func New(port string, db *sql.DB) (*Server, error) {
-	if port == "" {
-		return nil, errors.New("port is required")
-	}
-	if db == nil {
-		return nil, errors.New("database connection is required")
-	}
-
-	r := router.New(db)
-
-	srv := &Server{
-		httpServer: &http.Server{
-			Addr:         fmt.Sprintf(":%s", port),
-			Handler:      r,
-			ReadTimeout:  15 * time.Second,
-			WriteTimeout: 15 * time.Second,
-			IdleTimeout:  60 * time.Second,
-		},
-		port: port,
-		db:   db,
-	}
-
-	return srv, nil
-}
-
-func (s *Server) Start() error {
-	serverErrors := make(chan error, 1)
-
-	go func() {
-		serverErrors <- s.httpServer.ListenAndServe()
-	}()
-
-	shutdown := make(chan os.Signal, 1)
-	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
-
-	select {
-	case err := <-serverErrors:
-		return errors.Wrap(err, "server error")
-
-	case sig := <-shutdown:
-		fmt.Printf("\nReceived signal: %v. Starting graceful shutdown...\n", sig)
-
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-
-		if err := s.httpServer.Shutdown(ctx); err != nil {
-			s.httpServer.Close()
-			return errors.Wrap(err, "failed to gracefully shutdown server")
-		}
-	}
-
-	return nil
-}
-```
-
-### pkg/router/router.go
-
-```go
-package router
-
-import (
-	"database/sql"
-	"net/http"
-
-	"github.com/gorilla/mux"
-	"github.com/username/myapi/pkg/handlers"
-	"github.com/username/myapi/pkg/middleware"
-	"github.com/username/myapi/pkg/repository"
-)
-
-func New(db *sql.DB) *mux.Router {
-	r := mux.NewRouter()
-
-	// Middleware
-	r.Use(middleware.Logger)
-	r.Use(middleware.CORS)
-
-	// Health check
-	r.HandleFunc("/health", handlers.HealthCheck).Methods(http.MethodGet)
-
-	// Repositories
-	projectRepo := repository.NewProjectRepository(db)
-
-	// Handlers
-	projectHandler := handlers.NewProjectHandler(projectRepo)
-
-	// UUID pattern for path parameters
-	uuid := "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
-
-	// Project routes
-	r.HandleFunc("/projects", projectHandler.Create).Methods(http.MethodPost, http.MethodOptions)
-	r.HandleFunc("/projects", projectHandler.List).Methods(http.MethodGet, http.MethodOptions)
-	r.HandleFunc("/projects/{id:"+uuid+"}", projectHandler.Get).Methods(http.MethodGet, http.MethodOptions)
-	r.HandleFunc("/projects/{id:"+uuid+"}", projectHandler.Update).Methods(http.MethodPut, http.MethodOptions)
-	r.HandleFunc("/projects/{id:"+uuid+"}", projectHandler.Delete).Methods(http.MethodDelete, http.MethodOptions)
-
-	return r
-}
-```
-
-### pkg/middleware/cors.go
-
-```go
-package middleware
-
-import (
-	"net/http"
-	"os"
-	"strings"
-)
-
-func CORS(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		allowedOrigins := os.Getenv("ALLOWED_ORIGINS")
-		origins := strings.Split(allowedOrigins, ",")
-
-		origin := r.Header.Get("Origin")
-		for _, allowed := range origins {
-			if origin == strings.TrimSpace(allowed) {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-				break
-			}
-		}
-
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
-
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-```
-
-### pkg/middleware/logger.go
-
-```go
-package middleware
-
-import (
-	"log"
-	"net/http"
-	"time"
-)
-
-type responseWriter struct {
-	http.ResponseWriter
-	statusCode int
-}
-
-func (rw *responseWriter) WriteHeader(code int) {
-	rw.statusCode = code
-	rw.ResponseWriter.WriteHeader(code)
-}
-
-func Logger(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-
-		rw := &responseWriter{
-			ResponseWriter: w,
-			statusCode:     http.StatusOK,
-		}
-
-		next.ServeHTTP(rw, r)
-
-		log.Printf("%s %s %d %s", r.Method, r.RequestURI, rw.statusCode, time.Since(start))
-	})
-}
-```
-
-### pkg/errors/errors.go
-
-```go
-package errors
-
-import (
-	"errors"
-	"fmt"
-)
-
-func New(message string) error {
-	return errors.New(message)
-}
-
-func Wrap(err error, message string) error {
-	if err == nil {
-		return nil
-	}
-	return fmt.Errorf("%s: %w", message, err)
-}
-
-func Is(err, target error) bool {
-	return errors.Is(err, target)
-}
-```
-
-### pkg/models/project.go
-
-```go
-package models
-
-import "time"
-
-type Project struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Summary   string    `json:"summary"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-}
-
-type CreateProjectRequest struct {
-	Name    string `json:"name"`
-	Summary string `json:"summary"`
-}
-
-type UpdateProjectRequest struct {
-	Name    string `json:"name"`
-	Summary string `json:"summary"`
-	Status  string `json:"status"`
-}
-```
-
-### pkg/models/errors.go
-
-```go
-package models
-
-import "errors"
-
-var (
-	ErrProjectNotFound = errors.New("project not found")
-)
-```
-
-### pkg/repository/project.go
-
-```go
-package repository
-
-import (
-	"context"
-	"database/sql"
-
-	"github.com/username/myapi/pkg/errors"
-	"github.com/username/myapi/pkg/models"
-)
-
-type ProjectRepository struct {
-	db *sql.DB
-}
-
-func NewProjectRepository(db *sql.DB) *ProjectRepository {
-	return &ProjectRepository{db: db}
-}
-
-func (r *ProjectRepository) Create(ctx context.Context, req *models.CreateProjectRequest) (*models.Project, error) {
-	query := `
-		INSERT INTO projects (name, summary)
-		VALUES ($1, $2)
-		RETURNING id, name, summary, status, created_at, updated_at
-	`
-
-	var project models.Project
-	err := r.db.QueryRowContext(ctx, query, req.Name, req.Summary).Scan(
-		&project.ID,
-		&project.Name,
-		&project.Summary,
-		&project.Status,
-		&project.CreatedAt,
-		&project.UpdatedAt,
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to create project")
-	}
-
-	return &project, nil
-}
-
-func (r *ProjectRepository) GetByID(ctx context.Context, id string) (*models.Project, error) {
-	query := `
-		SELECT id, name, summary, status, created_at, updated_at
-		FROM projects WHERE id = $1
-	`
-
-	var project models.Project
-	err := r.db.QueryRowContext(ctx, query, id).Scan(
-		&project.ID,
-		&project.Name,
-		&project.Summary,
-		&project.Status,
-		&project.CreatedAt,
-		&project.UpdatedAt,
-	)
-	if err == sql.ErrNoRows {
-		return nil, models.ErrProjectNotFound
-	}
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get project")
-	}
-
-	return &project, nil
-}
-
-func (r *ProjectRepository) List(ctx context.Context) ([]*models.Project, error) {
-	query := `
-		SELECT id, name, summary, status, created_at, updated_at
-		FROM projects ORDER BY created_at DESC
-	`
-
-	rows, err := r.db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to list projects")
-	}
-	defer rows.Close()
-
-	var projects []*models.Project
-	for rows.Next() {
-		var project models.Project
-		if err := rows.Scan(
-			&project.ID,
-			&project.Name,
-			&project.Summary,
-			&project.Status,
-			&project.CreatedAt,
-			&project.UpdatedAt,
-		); err != nil {
-			return nil, errors.Wrap(err, "failed to scan project")
-		}
-		projects = append(projects, &project)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, errors.Wrap(err, "error iterating projects")
-	}
-
-	return projects, nil
-}
-
-func (r *ProjectRepository) Update(ctx context.Context, id string, req *models.UpdateProjectRequest) (*models.Project, error) {
-	query := `
-		UPDATE projects SET name = $1, summary = $2, status = $3
-		WHERE id = $4
-		RETURNING id, name, summary, status, created_at, updated_at
-	`
-
-	var project models.Project
-	err := r.db.QueryRowContext(ctx, query, req.Name, req.Summary, req.Status, id).Scan(
-		&project.ID,
-		&project.Name,
-		&project.Summary,
-		&project.Status,
-		&project.CreatedAt,
-		&project.UpdatedAt,
-	)
-	if err == sql.ErrNoRows {
-		return nil, models.ErrProjectNotFound
-	}
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to update project")
-	}
-
-	return &project, nil
-}
-
-func (r *ProjectRepository) Delete(ctx context.Context, id string) error {
-	query := `DELETE FROM projects WHERE id = $1`
-
-	result, err := r.db.ExecContext(ctx, query, id)
-	if err != nil {
-		return errors.Wrap(err, "failed to delete project")
-	}
-
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return models.ErrProjectNotFound
-	}
-
-	return nil
-}
-```
-
-### pkg/handlers/response.go
-
-```go
-package handlers
-
-import (
-	"encoding/json"
-	"net/http"
-)
-
-func respondJSON(w http.ResponseWriter, status int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
-}
-
-func respondError(w http.ResponseWriter, status int, message string) {
-	respondJSON(w, status, map[string]string{"error": message})
-}
-```
-
-### pkg/handlers/health.go
-
-```go
-package handlers
-
-import "net/http"
-
-func HealthCheck(w http.ResponseWriter, r *http.Request) {
-	respondJSON(w, http.StatusOK, map[string]string{"status": "healthy"})
-}
-```
-
-### pkg/handlers/projects.go
-
-```go
-package handlers
-
-import (
-	"encoding/json"
-	"log"
-	"net/http"
-
-	"github.com/gorilla/mux"
-	"github.com/username/myapi/pkg/errors"
-	"github.com/username/myapi/pkg/models"
-	"github.com/username/myapi/pkg/repository"
-)
-
-type ProjectHandler struct {
-	repo *repository.ProjectRepository
-}
-
-func NewProjectHandler(repo *repository.ProjectRepository) *ProjectHandler {
-	return &ProjectHandler{repo: repo}
-}
-
-func (h *ProjectHandler) Create(w http.ResponseWriter, r *http.Request) {
-	var req models.CreateProjectRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	if req.Name == "" {
-		respondError(w, http.StatusBadRequest, "name is required")
-		return
-	}
-
-	project, err := h.repo.Create(r.Context(), &req)
-	if err != nil {
-		log.Printf("Create: %v", err)
-		respondError(w, http.StatusInternalServerError, "failed to create project")
-		return
-	}
-
-	respondJSON(w, http.StatusCreated, project)
-}
-
-func (h *ProjectHandler) Get(w http.ResponseWriter, r *http.Request) {
-	id := mux.Vars(r)["id"]
-
-	project, err := h.repo.GetByID(r.Context(), id)
-	if err != nil {
-		if errors.Is(err, models.ErrProjectNotFound) {
-			respondError(w, http.StatusNotFound, "project not found")
-			return
-		}
-		log.Printf("Get: %v", err)
-		respondError(w, http.StatusInternalServerError, "failed to get project")
-		return
-	}
-
-	respondJSON(w, http.StatusOK, project)
-}
-
-func (h *ProjectHandler) List(w http.ResponseWriter, r *http.Request) {
-	projects, err := h.repo.List(r.Context())
-	if err != nil {
-		log.Printf("List: %v", err)
-		respondError(w, http.StatusInternalServerError, "failed to list projects")
-		return
-	}
-
-	respondJSON(w, http.StatusOK, projects)
-}
-
-func (h *ProjectHandler) Update(w http.ResponseWriter, r *http.Request) {
-	id := mux.Vars(r)["id"]
-
-	var req models.UpdateProjectRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	project, err := h.repo.Update(r.Context(), id, &req)
-	if err != nil {
-		if errors.Is(err, models.ErrProjectNotFound) {
-			respondError(w, http.StatusNotFound, "project not found")
-			return
-		}
-		log.Printf("Update: %v", err)
-		respondError(w, http.StatusInternalServerError, "failed to update project")
-		return
-	}
-
-	respondJSON(w, http.StatusOK, project)
-}
-
-func (h *ProjectHandler) Delete(w http.ResponseWriter, r *http.Request) {
-	id := mux.Vars(r)["id"]
-
-	if err := h.repo.Delete(r.Context(), id); err != nil {
-		if errors.Is(err, models.ErrProjectNotFound) {
-			respondError(w, http.StatusNotFound, "project not found")
-			return
-		}
-		log.Printf("Delete: %v", err)
-		respondError(w, http.StatusInternalServerError, "failed to delete project")
-		return
-	}
-
-	w.WriteHeader(http.StatusNoContent)
-}
-```
+**Pattern**: Provide sensible defaults, fail fast on missing required values.
 
 ## Database Migrations
 
-### migrations/000001_init_schema.up.sql
+### When to Run Migrations
 
-```sql
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+**Option 1: Manually**
+```bash
+# Using golang-migrate CLI
+migrate -path ./migrations -database "$DATABASE_URL" up
 ```
 
-### migrations/000001_init_schema.down.sql
+**Option 2: On application startup**
 
-```sql
--- Extensions typically not dropped
+```go
+func main() {
+    db, _ := database.Connect()
+
+    if err := runMigrations(db); err != nil {
+        log.Fatalf("migration failed: %v", err)
+    }
+
+    // Continue with server setup
+}
 ```
 
-### migrations/000002_create_projects.up.sql
+**Option 3: Separate init container (Kubernetes)**
 
-```sql
-CREATE TABLE IF NOT EXISTS projects (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    name VARCHAR(255) NOT NULL,
-    summary TEXT,
-    status VARCHAR(50) DEFAULT 'active',
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX idx_projects_name ON projects(name);
-CREATE INDEX idx_projects_status ON projects(status);
-
-CREATE OR REPLACE FUNCTION update_updated_at_column()
-RETURNS TRIGGER AS $$
-BEGIN
-    NEW.updated_at = CURRENT_TIMESTAMP;
-    RETURN NEW;
-END;
-$$ language 'plpgsql';
-
-CREATE TRIGGER update_projects_updated_at
-    BEFORE UPDATE ON projects
-    FOR EACH ROW
-    EXECUTE FUNCTION update_updated_at_column();
+```yaml
+initContainers:
+  - name: migrate
+    image: myapp:latest
+    command: ["./api", "migrate"]
 ```
 
-### migrations/000002_create_projects.down.sql
+**Recommendation**: Run migrations manually or via CI/CD for production. Automatic migration on startup can cause issues with multiple replicas racing to migrate.
 
-```sql
-DROP TRIGGER IF EXISTS update_projects_updated_at ON projects;
-DROP TABLE IF EXISTS projects;
+### Migration File Organization
+
+```
+migrations/
+├── 000001_create_users.up.sql
+├── 000001_create_users.down.sql
+├── 000002_create_articles.up.sql
+├── 000002_create_articles.down.sql
+└── ...
 ```
 
-## Usage Commands
+**Naming convention**:
+- Sequential numbers ensure order
+- Descriptive names explain purpose
+- Matching up/down pairs enable rollback
 
-### Development
+## Health Checks
+
+### Why Health Endpoints Matter
+
+In containerized deployments:
+- Load balancers check if instances are healthy
+- Orchestrators restart unhealthy containers
+- Deployment tools wait for health before routing traffic
+
+### Implementation
+
+```go
+func HealthCheck(db *sql.DB) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        // Check database connectivity
+        if err := db.PingContext(r.Context()); err != nil {
+            w.WriteHeader(http.StatusServiceUnavailable)
+            json.NewEncoder(w).Encode(map[string]string{
+                "status": "unhealthy",
+                "error":  "database unavailable",
+            })
+            return
+        }
+
+        w.WriteHeader(http.StatusOK)
+        json.NewEncoder(w).Encode(map[string]string{
+            "status": "healthy",
+        })
+    }
+}
+```
+
+**What to check**:
+- Database connection (`db.Ping()`)
+- External service dependencies (if critical)
+- Internal state (if applicable)
+
+**What not to check**:
+- Expensive operations that slow down health checks
+- Non-critical external services
+
+## Graceful Shutdown
+
+### The Problem
+
+When a container receives SIGTERM:
+1. Without handling: Process exits immediately, dropping active requests
+2. With graceful shutdown: Stop accepting new requests, finish active ones, then exit
+
+### Implementation
+
+```go
+func main() {
+    server := &http.Server{
+        Addr:    ":8000",
+        Handler: router,
+    }
+
+    // Start server in background
+    go func() {
+        if err := server.ListenAndServe(); err != http.ErrServerClosed {
+            log.Fatalf("server error: %v", err)
+        }
+    }()
+
+    // Wait for shutdown signal
+    quit := make(chan os.Signal, 1)
+    signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+    <-quit
+
+    log.Println("Shutting down...")
+
+    // Give active requests time to complete
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+
+    if err := server.Shutdown(ctx); err != nil {
+        log.Printf("Forced shutdown: %v", err)
+    }
+
+    // Close database connection
+    db.Close()
+
+    log.Println("Server stopped")
+}
+```
+
+### Shutdown Order
+
+1. Stop accepting new connections
+2. Wait for active requests to complete (with timeout)
+3. Close database connections
+4. Exit
+
+## Local Development Workflow
+
+### Starting the Stack
 
 ```bash
-# Start all services (postgres + api with hot reload)
-docker-compose up dev
+# Start all services
+docker-compose up
+
+# Or in detached mode
+docker-compose up -d
 
 # View logs
-docker-compose logs -f dev
-
-# Rebuild after go.mod changes
-docker-compose build dev && docker-compose up dev
-
-# Stop all services
-docker-compose down
+docker-compose logs -f api
 ```
 
-### Production
+### Common Operations
 
 ```bash
-# Build production image
-docker build -f Dockerfile -t myapi:latest .
+# Rebuild after changing Dockerfile
+docker-compose build api
 
-# Run with docker-compose
-docker-compose up release
+# Run database migrations
+docker-compose exec api ./api migrate up
 
-# Run standalone
-docker run -p 8080:80 \
-  -e POSTGRES_HOST=host.docker.internal \
-  -e POSTGRES_USER=user \
-  -e POSTGRES_PASSWORD=pass \
-  -e POSTGRES_DB=mydb \
-  -e ALLOWED_ORIGINS=https://myapp.com \
-  myapi:latest
+# Connect to PostgreSQL
+docker-compose exec postgres psql -U myapp -d myapp_development
+
+# Reset everything
+docker-compose down -v  # -v removes volumes
 ```
 
-### Database Operations
+### Debugging
 
 ```bash
-# Connect to postgres
-docker exec -it <container> psql -U myapi_user -d myapi_db
+# Shell into container
+docker-compose exec api sh
 
-# Run migrations (using golang-migrate)
-migrate -path migrations -database "postgres://user:pass@localhost:5432/mydb?sslmode=disable" up
+# Check environment variables
+docker-compose exec api env
 
-# Check current version
-migrate -path migrations -database "..." version
-
-# Rollback one migration
-migrate -path migrations -database "..." down 1
-```
-
-### Local Development (without Docker)
-
-```bash
-# Install dependencies
-go mod download
-
-# Run with Air (hot reload)
-air
-
-# Run directly
-go run main.go
-
-# Build binary
-go build -o bin/api main.go
-./bin/api
-```
-
-## API Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | /health | Health check |
-| GET | /projects | List all projects |
-| POST | /projects | Create project |
-| GET | /projects/{id} | Get project by ID |
-| PUT | /projects/{id} | Update project |
-| DELETE | /projects/{id} | Delete project |
-
-### Example Requests
-
-```bash
-# Health check
-curl http://localhost:8000/health
-
-# Create project
-curl -X POST http://localhost:8000/projects \
-  -H "Content-Type: application/json" \
-  -d '{"name": "My Project", "summary": "Description"}'
-
-# List projects
-curl http://localhost:8000/projects
-
-# Get project
-curl http://localhost:8000/projects/{uuid}
-
-# Update project
-curl -X PUT http://localhost:8000/projects/{uuid} \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Updated", "summary": "New desc", "status": "active"}'
-
-# Delete project
-curl -X DELETE http://localhost:8000/projects/{uuid}
+# Test database connection
+docker-compose exec api nc -zv postgres 5432
 ```
 
 ## Best Practices Summary
 
 ### Architecture
 
-1. **Layered structure** - handlers → repository → database
-2. **Dependency injection** - Pass dependencies through constructors
-3. **Domain errors** - Define sentinel errors in models
-4. **Graceful shutdown** - Handle signals properly
-
-### Database
-
-5. **Connection pooling** - Configure pool settings
-6. **Retry logic** - Retry connections on startup
-7. **Context propagation** - Pass context for cancellation
-8. **RETURNING clause** - Get updated data in single query
+1. **Clear dependency direction** - Handlers → Repositories → Database
+2. **Minimal main.go** - Just wiring, no business logic
+3. **Pass dependencies explicitly** - No global state
 
 ### Docker
 
-9. **Multi-stage builds** - Separate build and runtime
-10. **Alpine images** - Smaller image sizes
-11. **Volume mounts** - Enable hot reload in dev
-12. **YAML anchors** - Reduce configuration duplication
+4. **Multi-stage builds** - Small production images
+5. **Volume mounts for development** - Enable hot reload
+6. **Named volumes for data** - Persist database across restarts
+7. **Use networks** - Isolated service communication
 
-### Error Handling
+### Database
 
-13. **Wrap errors** - Add context as errors propagate
-14. **Log internally** - Log details, return generic messages
-15. **Use sentinel errors** - Check with `errors.Is()`
-16. **Validate input** - Check required fields in handlers
+8. **Retry connections on startup** - Handle container startup order
+9. **Configure connection pool** - Don't use defaults in production
+10. **Run migrations deliberately** - Not automatically in production
+
+### Operations
+
+11. **Health endpoints** - Enable load balancer and orchestrator integration
+12. **Graceful shutdown** - Don't drop active requests
+13. **Environment configuration** - Use .env files, never commit secrets
+14. **Structured logging** - Include request IDs and context

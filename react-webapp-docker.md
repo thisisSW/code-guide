@@ -1,239 +1,173 @@
 # React Web Application with Docker
 
-Complete guide for building a React frontend application with TypeScript, Vite, and Docker multi-stage builds.
+This guide explains how to containerize a React application for both development and production, covering the architectural decisions behind multi-stage builds, development workflows, and deployment strategies.
 
-> **Prerequisites**: See [typescript.md](./typescript.md), [vite-react.md](./vite-react.md), and [docker.md](./docker.md) for individual technology details.
+> **Prerequisites**: See [vite-react.md](./vite-react.md) for React/Vite setup and [docker.md](./docker.md) for Docker fundamentals.
 
-## Project Structure
+## The Two-Environment Challenge
 
-```
-project-root/
-├── Dockerfile              # Production multi-stage build
-├── Dockerfile.dev          # Development with hot reload
-├── docker-compose.yaml     # Service orchestration
-├── nginx.conf              # Nginx configuration
-├── .dockerignore           # Files to exclude from build
-├── .env                    # Environment variables
-├── .env.example            # Environment template
-├── index.html              # HTML entry point
-├── package.json            # Dependencies and scripts
-├── tsconfig.json           # TypeScript config
-├── tsconfig.node.json      # TypeScript config for Vite
-├── vite.config.ts          # Vite configuration
-├── public/                 # Static assets
-│   └── favicon.ico
-└── src/
-    ├── main.tsx            # Application entry
-    ├── App/                # Root component
-    │   ├── index.tsx
-    │   └── App.css
-    ├── types/              # TypeScript types
-    │   ├── index.ts
-    │   ├── project.ts
-    │   └── api.ts
-    ├── services/           # API layer
-    │   ├── index.ts
-    │   ├── api.ts
-    │   └── projects.ts
-    ├── styles/             # Global styles
-    │   ├── global.css
-    │   └── cssModules.d.ts
-    └── [Feature]/          # Feature components
-        ├── index.tsx
-        └── Feature.module.css
+Web applications need different things in development vs production:
+
+**Development needs**:
+- Fast feedback (hot module replacement)
+- Source maps for debugging
+- Full Node.js environment with dev dependencies
+- Volume mounts for live code changes
+
+**Production needs**:
+- Minimal image size (faster deploys, smaller attack surface)
+- Optimized, minified bundles
+- No dev dependencies or source code
+- Efficient static file serving
+
+Docker solves this with separate Dockerfiles and multi-stage builds.
+
+## Development Container Strategy
+
+### Goals
+
+1. **Instant feedback**: Code changes appear immediately in the browser
+2. **Parity with local dev**: Same experience as running `npm run dev` locally
+3. **Isolated dependencies**: Node modules live in the container, not your filesystem
+
+### How Hot Reload Works in Docker
+
+The Vite dev server watches for file changes. In Docker, we mount source directories as volumes:
+
+```yaml
+volumes:
+  - ./src:/app/src      # Source code
+  - ./public:/app/public # Static assets
 ```
 
-## Configuration Files
+When you edit a file locally:
+1. The change is reflected in the container (via volume mount)
+2. Vite detects the change
+3. Vite sends an HMR update to the browser
+4. The browser updates without a full reload
 
-### package.json
+### Development Dockerfile Explained
 
-```json
-{
-  "name": "my-app",
-  "private": true,
-  "version": "0.0.1",
-  "type": "module",
-  "scripts": {
-    "dev": "vite",
-    "build": "tsc && vite build",
-    "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
-    "preview": "vite preview",
-    "type-check": "tsc --noEmit"
-  },
-  "dependencies": {
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "react-router-dom": "^7.1.3"
-  },
-  "devDependencies": {
-    "@types/node": "^22.10.5",
-    "@types/react": "^18.3.18",
-    "@types/react-dom": "^18.3.5",
-    "@typescript-eslint/eslint-plugin": "^8.20.0",
-    "@typescript-eslint/parser": "^8.20.0",
-    "@vitejs/plugin-react": "^4.3.4",
-    "eslint": "^9.18.0",
-    "eslint-plugin-react-hooks": "^5.1.0",
-    "eslint-plugin-react-refresh": "^0.4.16",
-    "typescript": "^5.7.3",
-    "vite": "^6.0.11"
-  }
-}
+```dockerfile
+FROM node:20-alpine
+WORKDIR /app
+
+# Copy package files first (layer caching)
+COPY package*.json ./
+RUN npm install
+
+# Copy source files
+COPY . .
+
+# Expose the dev server port
+EXPOSE 5173
+
+# Run dev server, accessible from outside container
+CMD ["npm", "run", "dev", "--", "--host"]
 ```
 
-### vite.config.ts
+**Key decisions**:
+
+**`--host` flag**: By default, Vite binds to `localhost`, which is only accessible inside the container. `--host` binds to `0.0.0.0`, making it accessible from your browser.
+
+**Layer ordering**: Package files are copied and installed before source code. Since dependencies change less frequently than source code, Docker can cache the `npm install` layer and skip it on subsequent builds.
+
+**Alpine base**: The `alpine` variant is much smaller (~50MB vs ~350MB for full Node), reducing image size and pull times.
+
+### File Watching in Docker
+
+Some Docker setups (especially on Windows or macOS) don't support native filesystem events. Configure Vite to use polling:
 
 ```typescript
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
-import path from 'path'
-
+// vite.config.ts
 export default defineConfig({
-  plugins: [react()],
-  resolve: {
-    alias: {
-      '@': path.resolve(__dirname, './src'),
-    },
-  },
   server: {
-    host: true,
-    port: 5173,
     watch: {
-      usePolling: true,
-    },
-  },
-  css: {
-    modules: {
-      localsConvention: 'camelCase',
-      generateScopedName: '[name]__[local]___[hash:base64:5]',
-    },
-  },
-  build: {
-    outDir: 'dist',
-    sourcemap: true,
-    rollupOptions: {
-      output: {
-        manualChunks: {
-          vendor: ['react', 'react-dom', 'react-router-dom'],
-        },
-      },
+      usePolling: true,  // Works with any Docker setup
     },
   },
 })
 ```
 
-### tsconfig.json
+**Trade-off**: Polling uses more CPU than native watching, but ensures reliability across all platforms.
 
-```json
-{
-  "compilerOptions": {
-    "target": "ES2020",
-    "useDefineForClassFields": true,
-    "lib": ["ES2020", "DOM", "DOM.Iterable"],
-    "module": "ESNext",
-    "skipLibCheck": true,
-    "moduleResolution": "bundler",
-    "allowImportingTsExtensions": true,
-    "resolveJsonModule": true,
-    "isolatedModules": true,
-    "noEmit": true,
-    "jsx": "react-jsx",
-    "strict": true,
-    "noUnusedLocals": true,
-    "noUnusedParameters": true,
-    "noFallthroughCasesInSwitch": true,
-    "baseUrl": ".",
-    "paths": {
-      "@/*": ["./src/*"]
-    }
-  },
-  "include": ["src"],
-  "references": [{ "path": "./tsconfig.node.json" }]
-}
-```
+## Production Build Strategy
 
-### index.html
+### The Multi-Stage Approach
 
-```html
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>My App</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
-  </body>
-</html>
-```
+Production builds use two stages:
 
-## Docker Configuration
-
-### Dockerfile (Production)
-
-Multi-stage build for optimized production image with Nginx.
+1. **Build stage**: Full Node.js environment to compile the application
+2. **Serve stage**: Minimal web server with only the compiled output
 
 ```dockerfile
-FROM node:alpine as build
+# Stage 1: Build
+FROM node:20-alpine AS build
 WORKDIR /app
 COPY package*.json ./
-RUN npm install
+RUN npm ci
 COPY . .
-# Transpiles TypeScript to JavaScript
 RUN npm run build
 
-FROM nginx:alpine as release
+# Stage 2: Serve
+FROM nginx:alpine
 COPY --from=build /app/dist /usr/share/nginx/html
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 EXPOSE 80
 CMD ["nginx", "-g", "daemon off;"]
 ```
 
-**Key Points**:
-- **Build stage**: Full Node.js with build tools
-- **Release stage**: Minimal Nginx for serving static files
-- `npm run build` runs TypeScript compiler then Vite build
-- Copies only built artifacts to final image
+**Why two stages?**
 
-### Dockerfile.dev (Development)
+| | Build Stage | Final Image |
+|---|---|---|
+| Node.js | Yes | No |
+| npm/package.json | Yes | No |
+| Source code | Yes | No |
+| node_modules | Yes | No |
+| Built assets | Yes | Yes |
+| Image size | ~400MB | ~25MB |
 
-Development container with hot reload.
+The final image contains only what's needed to serve static files.
+
+### npm ci vs npm install
 
 ```dockerfile
-FROM node:24-alpine
-WORKDIR /app
-COPY package*.json ./
-RUN npm install
-RUN chmod -R +x node_modules/.bin
-COPY . .
-EXPOSE 5173
-# Runs Vite dev server with TS compiler (no transpilation)
-CMD ["npm", "run", "dev", "--", "--host"]
+RUN npm ci  # Not npm install
 ```
 
-**Key Points**:
-- Single stage for simplicity
-- `--host` exposes dev server to Docker network
-- Volume mounts enable hot reload (see docker-compose)
+**`npm ci`** (clean install):
+- Removes existing node_modules
+- Installs exactly what's in package-lock.json
+- Fails if package.json and lock file are out of sync
+- Faster and more reliable for CI/CD
 
-### nginx.conf
+**`npm install`**:
+- May update package-lock.json
+- Resolves versions according to semver ranges
+- Can produce different results on different runs
+
+For production builds, always use `npm ci` for reproducibility.
+
+## Serving Strategy: Nginx vs Node.js
+
+### Option 1: Nginx (Recommended for Static SPAs)
+
+Nginx excels at serving static files:
 
 ```nginx
 server {
     listen 80;
-    server_name localhost;
     root /usr/share/nginx/html;
     index index.html;
 
+    # SPA routing: serve index.html for all routes
     location / {
         try_files $uri $uri/ /index.html;
     }
 
-    # Cache static assets
-    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
+    # Cache static assets aggressively
+    location ~* \.(js|css|png|jpg|ico|svg|woff2)$ {
         expires 1y;
         add_header Cache-Control "public, immutable";
     }
@@ -241,435 +175,221 @@ server {
     # Security headers
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
-    add_header X-XSS-Protection "1; mode=block" always;
 
-    # Gzip compression
+    # Enable compression
     gzip on;
-    gzip_vary on;
-    gzip_min_length 10240;
-    gzip_types text/plain text/css text/xml text/javascript application/x-javascript application/xml+rss application/json;
+    gzip_types text/plain text/css application/json application/javascript;
 }
 ```
 
-**Key Points**:
-- `try_files $uri $uri/ /index.html` enables SPA routing
-- Aggressive caching for static assets
-- Security headers for protection
-- Gzip compression for performance
+**Why `try_files $uri $uri/ /index.html`?**
 
-### docker-compose.yaml
+Single Page Applications handle routing client-side. When a user navigates to `/users/123`:
+
+1. Browser requests `/users/123` from the server
+2. Server doesn't have a file at that path
+3. Without SPA handling, server returns 404
+4. With `try_files`, server returns `index.html`
+5. React Router sees the URL and renders the correct component
+
+**Caching strategy**:
+
+Vite generates filenames with content hashes (e.g., `main.a1b2c3d4.js`). When content changes, the filename changes. This enables aggressive caching:
+
+- Hashed files: Cache for 1 year (`immutable` means "never revalidate")
+- `index.html`: Don't cache (it references the current hashed files)
+
+### Option 2: Node.js Server (When You Need Runtime Logic)
+
+Use a Node.js server when you need:
+- Server-side runtime configuration
+- API proxying
+- Server-side rendering
+- Custom middleware
+
+```javascript
+// server/index.js
+import express from 'express';
+import path from 'path';
+
+const app = express();
+
+// Serve static files
+app.use(express.static(path.resolve('./dist')));
+
+// Runtime configuration endpoint
+app.get('/config', (req, res) => {
+  res.json({
+    apiUrl: process.env.API_URL,
+    featureFlags: process.env.FEATURE_FLAGS,
+  });
+});
+
+// SPA fallback
+app.get('*', (req, res) => {
+  res.sendFile(path.resolve('./dist/index.html'));
+});
+
+app.listen(process.env.PORT || 80);
+```
+
+**Trade-off**: Nginx serves static files ~2-3x faster than Node.js, but Node.js provides flexibility for runtime behavior.
+
+## Environment Variables
+
+### The Build-Time vs Runtime Problem
+
+Vite embeds environment variables at build time:
+
+```typescript
+// This value is baked into the bundle during build
+const apiUrl = import.meta.env.VITE_API_URL;
+```
+
+This means the same image can't be used with different API URLs—you'd need to rebuild for each environment.
+
+### Solution 1: Build Per Environment
+
+Build separate images for each environment:
+
+```bash
+# Staging
+docker build --build-arg VITE_API_URL=https://staging-api.example.com -t myapp:staging .
+
+# Production
+docker build --build-arg VITE_API_URL=https://api.example.com -t myapp:production .
+```
+
+**Pros**: Simple, no runtime complexity
+**Cons**: Multiple images, longer deploy pipelines
+
+### Solution 2: Runtime Configuration
+
+Serve configuration from an endpoint:
+
+```javascript
+// In your application entry point
+async function loadConfig() {
+  const response = await fetch('/config');
+  const config = await response.json();
+  window.__CONFIG__ = config;
+}
+
+await loadConfig();
+// Then render your app
+```
+
+**Pros**: One image for all environments
+**Cons**: Extra HTTP request on startup, more complex server setup
+
+### Which to Choose?
+
+**Build per environment** when:
+- You have few environments
+- CI/CD can easily build multiple images
+- You want simpler runtime behavior
+
+**Runtime configuration** when:
+- You deploy to many environments
+- You need to change config without rebuilding
+- You're using Kubernetes with ConfigMaps
+
+## Docker Compose for Development
+
+### Complete Development Setup
 
 ```yaml
 services:
-  dev:
+  app:
     build:
       context: .
-      dockerfile: ./Dockerfile.dev
-    environment:
-      VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+      dockerfile: Dockerfile.dev
     ports:
-      - 5173:5173
+      - "5173:5173"
     volumes:
       - ./src:/app/src
       - ./public:/app/public
+      - ./index.html:/app/index.html
+    environment:
+      - VITE_API_URL=http://localhost:8000
+```
 
-  release:
+**Volume mounts explained**:
+
+```yaml
+volumes:
+  - ./src:/app/src         # Mount source for hot reload
+  - ./public:/app/public   # Mount static assets
+  - ./index.html:/app/index.html  # Mount HTML template
+  # Note: node_modules NOT mounted - stays in container
+```
+
+**Why not mount node_modules?**
+
+1. **Platform differences**: Native modules compiled for macOS won't work in Linux container
+2. **Performance**: node_modules contains thousands of files; syncing them slows everything down
+3. **Isolation**: Each environment has its own dependencies
+
+### Connecting to Backend Services
+
+```yaml
+services:
+  frontend:
     build:
       context: .
-      dockerfile: ./Dockerfile
-    environment:
-      VITE_API_URL: ${VITE_API_URL:-http://localhost:8080}
+      dockerfile: Dockerfile.dev
     ports:
-      - 3000:80
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://api:8000
+    depends_on:
+      - api
+    networks:
+      - app-network
+
+  api:
+    build: ../backend
+    ports:
+      - "8000:8000"
+    networks:
+      - app-network
+
+networks:
+  app-network:
 ```
 
-**Key Points**:
-- Volume mounts for hot reload in development
-- Environment variables with defaults
-- Different port mappings for dev/prod
+**Why a shared network?**
 
-### .dockerignore
+Services on the same Docker network can reach each other by service name. `http://api:8000` resolves to the API container.
 
-```
-node_modules
-dist
-.git
-.gitignore
-*.md
-.env
-.env.*
-.DS_Store
-npm-debug.log*
-coverage
-.vscode
-.idea
-```
+**Note**: `VITE_API_URL=http://api:8000` works for server-side code, but the browser can't resolve `api`. For browser requests, you might need:
+- Use `localhost:8000` (since port is exposed)
+- Set up a reverse proxy
 
-### .env.example
-
-```bash
-VITE_API_URL=http://localhost:8000
-```
-
-## Application Code
-
-### src/main.tsx
-
-```typescript
-import { StrictMode } from 'react'
-import { createRoot } from 'react-dom/client'
-import App from './App'
-import './styles/global.css'
-
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-)
-```
-
-### src/App/index.tsx
-
-```typescript
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
-import Navigation from '../Navigation'
-import ProjectListPage from '../ProjectListPage'
-import ProjectDetailPage from '../ProjectDetailPage'
-import './App.css'
-
-export default function App() {
-  return (
-    <BrowserRouter>
-      <div className="app">
-        <Navigation />
-        <div className="content">
-          <Routes>
-            <Route path="/" element={<Navigate to="/projects" replace />} />
-            <Route path="/projects" element={<ProjectListPage />} />
-            <Route path="/projects/:id" element={<ProjectDetailPage />} />
-          </Routes>
-        </div>
-      </div>
-    </BrowserRouter>
-  )
-}
-```
-
-### src/types/project.ts
-
-```typescript
-export interface Project {
-  id: string
-  name: string
-  summary?: string
-  status: ProjectStatus
-  created_at: string
-  updated_at: string
-}
-
-export enum ProjectStatus {
-  Active = 'active',
-  OnHold = 'on_hold',
-  Archived = 'archived',
-}
-
-export interface CreateProjectRequest {
-  name: string
-  summary?: string
-}
-
-export interface UpdateProjectRequest {
-  name: string
-  summary?: string
-  status?: ProjectStatus
-}
-```
-
-### src/types/index.ts
-
-```typescript
-export * from './project'
-export * from './api'
-```
-
-### src/services/api.ts
-
-```typescript
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
-
-export class ApiError extends Error {
-  constructor(public status: number, message: string) {
-    super(message)
-    this.name = 'ApiError'
-  }
-}
-
-export async function fetchApi<T>(
-  endpoint: string,
-  options?: RequestInit
-): Promise<T> {
-  const url = `${API_URL}${endpoint}`
-
-  try {
-    const response = await fetch(url, {
-      ...options,
-      headers: {
-        'Content-Type': 'application/json',
-        ...options?.headers,
-      },
-      credentials: 'include',
-    })
-
-    if (!response.ok) {
-      throw new ApiError(response.status, `API Error: ${response.statusText}`)
-    }
-
-    return await response.json()
-  } catch (error) {
-    if (error instanceof ApiError) {
-      throw error
-    }
-    console.error('API Error:', error)
-    throw new Error('Network error occurred')
-  }
-}
-```
-
-### src/services/projects.ts
-
-```typescript
-import { fetchApi } from '@/services/api'
-import type { Project, CreateProjectRequest, UpdateProjectRequest } from '@/types'
-
-export const projectsService = {
-  list: async (): Promise<Project[]> => {
-    return fetchApi<Project[]>('/projects')
-  },
-
-  get: async (id: string): Promise<Project> => {
-    return fetchApi<Project>(`/projects/${id}`)
-  },
-
-  create: async (data: CreateProjectRequest): Promise<Project> => {
-    return fetchApi<Project>('/projects', {
-      method: 'POST',
-      body: JSON.stringify(data),
-    })
-  },
-
-  update: async (id: string, data: UpdateProjectRequest): Promise<Project> => {
-    return fetchApi<Project>(`/projects/${id}`, {
-      method: 'PUT',
-      body: JSON.stringify(data),
-    })
-  },
-
-  delete: async (id: string): Promise<void> => {
-    await fetchApi(`/projects/${id}`, { method: 'DELETE' })
-  },
-}
-```
-
-### src/styles/cssModules.d.ts
-
-```typescript
-declare module '*.module.css' {
-  const classes: { [key: string]: string }
-  export default classes
-}
-```
-
-## Example Component
-
-### src/ProjectDetailPage/index.tsx
-
-```typescript
-import { useState, useEffect } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
-import { projectsService } from '@/services/projects'
-import type { Project } from '@/types'
-import styles from './ProjectDetailPage.module.css'
-
-export default function ProjectDetailPage() {
-  const { id } = useParams<{ id: string }>()
-  const navigate = useNavigate()
-  const [project, setProject] = useState<Project | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    async function fetchProject() {
-      if (!id) return
-
-      try {
-        setLoading(true)
-        setError(null)
-        const data = await projectsService.get(id)
-        setProject(data)
-      } catch (err) {
-        setError('Failed to load project')
-        console.error(err)
-      } finally {
-        setLoading(false)
-      }
-    }
-
-    fetchProject()
-  }, [id])
-
-  const handleDelete = async () => {
-    if (!id || !window.confirm('Delete this project?')) return
-
-    try {
-      await projectsService.delete(id)
-      navigate('/projects')
-    } catch (err) {
-      setError('Failed to delete project')
-    }
-  }
-
-  if (loading) return <div className={styles.loading}>Loading...</div>
-  if (error) return <div className={styles.error}>{error}</div>
-  if (!project) return <div className={styles.error}>Project not found</div>
-
-  return (
-    <div className={styles.container}>
-      <h1 className={styles.title}>{project.name}</h1>
-      <p className={styles.summary}>{project.summary}</p>
-      <div className={styles.actions}>
-        <button onClick={handleDelete} className={styles.deleteBtn}>
-          Delete
-        </button>
-      </div>
-    </div>
-  )
-}
-```
-
-### src/ProjectDetailPage/ProjectDetailPage.module.css
-
-```css
-.container {
-  max-width: 800px;
-  margin: 2rem auto;
-  padding: 2rem;
-}
-
-.title {
-  font-size: 2rem;
-  margin-bottom: 1rem;
-}
-
-.summary {
-  color: var(--text-secondary);
-  margin-bottom: 2rem;
-}
-
-.loading,
-.error {
-  text-align: center;
-  padding: 2rem;
-}
-
-.error {
-  color: #d32f2f;
-}
-
-.actions {
-  display: flex;
-  gap: 1rem;
-}
-
-.deleteBtn {
-  background-color: #d32f2f;
-  color: white;
-  border: none;
-  padding: 0.5rem 1rem;
-  border-radius: 4px;
-  cursor: pointer;
-}
-
-.deleteBtn:hover {
-  background-color: #b71c1c;
-}
-```
-
-## Usage Commands
+## Best Practices Summary
 
 ### Development
 
-```bash
-# Start development container with hot reload
-docker-compose up dev
-
-# Or with environment file
-docker-compose --env-file .env.dev up dev
-
-# View logs
-docker-compose logs -f dev
-
-# Stop
-docker-compose down
-```
+1. **Use volume mounts for source code** - Enables hot reload without rebuilding
+2. **Keep node_modules in the container** - Avoids platform compatibility issues
+3. **Configure polling for file watching** - Ensures reliability across platforms
+4. **Use `--host` flag** - Makes dev server accessible from outside container
 
 ### Production
 
-```bash
-# Build production image
-docker build -f Dockerfile -t myapp:latest .
+5. **Multi-stage builds** - Separate build environment from runtime environment
+6. **Use `npm ci`** - Reproducible installs from lock file
+7. **Choose the right server** - Nginx for static files, Node.js for runtime logic
+8. **Aggressive caching** - Leverage content hashing for long cache times
 
-# Run production container
-docker run -p 80:80 myapp:latest
+### Environment Variables
 
-# Or use docker-compose
-docker-compose up release
-```
+9. **Understand build-time vs runtime** - Vite embeds variables at build time
+10. **Choose a strategy** - Build per environment or runtime configuration
+11. **Never expose secrets** - `VITE_` variables are visible in browser
 
-### Local Development (without Docker)
+### Security
 
-```bash
-# Install dependencies
-npm install
-
-# Start dev server
-npm run dev
-
-# Type check
-npm run type-check
-
-# Build for production
-npm run build
-
-# Preview production build
-npm run preview
-```
-
-## Best Practices
-
-### Docker
-
-1. **Multi-stage builds** - Separate build and runtime stages
-2. **Alpine base images** - Smaller image sizes
-3. **.dockerignore** - Exclude unnecessary files
-4. **Volume mounts** - Enable hot reload in development
-5. **Environment defaults** - Use `${VAR:-default}` syntax
-
-### TypeScript
-
-6. **Strict mode** - Enable all strict checks
-7. **Path aliases** - Use `@/` for clean imports
-8. **Type exports** - Export types from barrel files
-9. **Interface props** - Type all component props
-
-### React
-
-10. **Feature folders** - Organize by feature, not file type
-11. **CSS Modules** - Scoped styles per component
-12. **Service layer** - Isolate API calls
-13. **Error states** - Handle loading, error, and empty states
-
-### Vite
-
-14. **Manual chunks** - Split vendor libraries
-15. **Source maps** - Enable for debugging
-16. **Polling** - Use `usePolling` in Docker
+12. **Add security headers** - X-Frame-Options, X-Content-Type-Options
+13. **Minimize image size** - Less code means smaller attack surface
+14. **Keep base images updated** - Regularly update to get security patches

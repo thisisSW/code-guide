@@ -1,460 +1,451 @@
-# Docker Patterns for Frontend Applications
+# Docker Patterns for Applications
 
-This document outlines Docker containerization patterns for frontend web applications, including development and production configurations.
+This guide covers Docker containerization patterns, focusing on the decisions and trade-offs involved in containerizing web applications for development and production.
 
-## Multi-Stage Production Build
+## Why Docker?
 
-### Pattern: Build + Serve
+### The Problems Docker Solves
 
-A two-stage Dockerfile optimizes image size by separating build dependencies from runtime:
+**"Works on my machine"**: Different developers have different Node versions, different global packages, different OS configurations. Docker ensures everyone runs the same environment.
+
+**Environment parity**: Development, staging, and production can run identical containers, eliminating environment-specific bugs.
+
+**Dependency isolation**: Applications don't share dependencies or conflict with each other.
+
+**Reproducible builds**: Given the same Dockerfile and source code, you get the same image every time.
+
+### When Docker Adds Overhead
+
+Docker isn't always the answer:
+- Simple scripts that run occasionally
+- Early prototypes where speed of iteration matters more than consistency
+- Teams without Docker expertise (learning curve is real)
+- Resource-constrained environments where container overhead matters
+
+## Understanding Images and Containers
+
+### The Relationship
+
+An **image** is a blueprint—a read-only template containing your application and its dependencies.
+
+A **container** is a running instance of an image—an isolated process with its own filesystem, network, and process space.
+
+```
+Dockerfile → (build) → Image → (run) → Container
+```
+
+You can run multiple containers from the same image, each with its own state.
+
+### Layer Caching
+
+Docker builds images in layers. Each instruction creates a layer:
 
 ```dockerfile
-# Build stage
-FROM node:22-alpine AS build
+FROM node:20-alpine          # Layer 1: Base image
+WORKDIR /app                 # Layer 2: Set working directory
+COPY package*.json ./        # Layer 3: Copy package files
+RUN npm install              # Layer 4: Install dependencies
+COPY . .                     # Layer 5: Copy source code
+RUN npm run build            # Layer 6: Build application
+```
+
+**Why order matters**: Docker caches layers. If a layer hasn't changed, Docker reuses the cached version. This is why we copy `package.json` before the source code—dependencies change less often than code.
+
+**Bad order** (rebuilds npm install on every code change):
+```dockerfile
+COPY . .                     # Source changes invalidate this layer
+RUN npm install              # Must reinstall every time
+```
+
+**Good order** (only rebuilds npm install when dependencies change):
+```dockerfile
+COPY package*.json ./        # Only changes when deps change
+RUN npm install              # Cached unless deps changed
+COPY . .                     # Source changes only affect this layer
+```
+
+## Multi-Stage Builds
+
+### The Problem with Single-Stage
+
+A single-stage build includes everything needed to build the application:
+
+```dockerfile
+FROM node:20
 WORKDIR /app
-COPY package.json .
-COPY package-lock.json .
-COPY index.html .
-COPY vite.config.js .
-COPY public/ public/
-COPY src/ src/
+COPY . .
+RUN npm install
+RUN npm run build
+CMD ["node", "server.js"]
+```
+
+This image contains:
+- Full Node.js installation (~300MB)
+- npm and all tooling
+- node_modules including dev dependencies
+- Source code
+- Built output
+
+Result: ~800MB+ image with lots of unnecessary files.
+
+### The Multi-Stage Solution
+
+Separate building from running:
+
+```dockerfile
+# Stage 1: Build environment
+FROM node:20 AS build
+WORKDIR /app
+COPY package*.json ./
 RUN npm ci
+COPY . .
 RUN npm run build
 
-# Production stage
-FROM alpine
-RUN apk add --update nodejs
-COPY --from=build /app/package.json /app/package.json
-COPY --from=build /app/dist /app/dist
-COPY --from=build /app/node_modules /app/node_modules
-COPY server/ /app/server
-EXPOSE 80
-ENTRYPOINT node /app/server/index.js
-```
-
-### Key Principles
-
-1. **Build Stage** (`node:22-alpine AS build`)
-   - Uses full Node.js image with build tools
-   - Copies only necessary source files
-   - Runs `npm ci` for reproducible installs
-   - Executes build command (`npm run build`)
-
-2. **Production Stage** (final stage)
-   - Uses minimal `alpine` base image
-   - Installs only Node.js runtime (no build tools)
-   - Copies only built artifacts from build stage
-   - Copies custom server for serving static files
-   - Minimal attack surface and smaller image size
-
-## Development Dockerfile
-
-### Pattern: Hot Reload Development Server
-
-```dockerfile
-FROM node:22-alpine
+# Stage 2: Production environment
+FROM node:20-alpine
 WORKDIR /app
-COPY package.json .
-COPY package-lock.json .
-COPY index.html .
-COPY vite.config.js .
-COPY public/ public/
-COPY src/ src/
-RUN npm ci
-ENTRYPOINT npm run dev -- --host
+COPY --from=build /app/dist ./dist
+COPY --from=build /app/package*.json ./
+RUN npm ci --production
+CMD ["node", "dist/server.js"]
 ```
 
-### Key Features
+**What happens**:
+1. First stage builds the application
+2. Second stage starts fresh with a minimal base
+3. `COPY --from=build` copies only what's needed
+4. First stage is discarded—not part of final image
 
-- Single stage for simplicity
-- All source files included
-- Dev server runs with `--host` flag to allow external access
-- Pairs with volume mounts for hot reload (see docker-compose below)
+**Result**: ~150MB image with only production essentials.
 
-## Docker Compose Configuration
+### Choosing Base Images
 
-### Pattern: Environment Variable Management + Volume Mounting
+| Base Image | Size | Use Case |
+|------------|------|----------|
+| `node:20` | ~350MB | Building, full tooling needed |
+| `node:20-slim` | ~200MB | Production with some tooling |
+| `node:20-alpine` | ~50MB | Production, minimal footprint |
+| `alpine` | ~5MB | Static files only (with nginx) |
 
-```yaml
-x-environment-vars: &environment-vars
-  VITE_API_BASE_URL: ${VITE_API_BASE_URL}
-  VITE_BUILD_BASE_URL: ${VITE_BUILD_BASE_URL}
-  VITE_BUILD_VERSION: ${VITE_BUILD_VERSION}
-  VITE_CHARACTER_FBX_URL: ${VITE_CHARACTER_FBX_URL}
-  VITE_DOWNLOAD_URL: ${VITE_DOWNLOAD_URL}
-  VITE_DISCORD_URL: ${VITE_DISCORD_URL}
-  VITE_HOST: ${VITE_HOST}
+**Alpine trade-offs**:
+- Much smaller
+- Uses musl instead of glibc (some native packages may not work)
+- Smaller package ecosystem
+- Good for most applications
 
-services:
+## Development vs Production Patterns
 
-  dev: 
-    build: 
-      context: .
-      dockerfile: ./Dockerfile.dev
-    environment:
-      <<: *environment-vars
-      PORT: 5173
-    ports:
-      - 5173:5173
-    volumes:
-      - ./public:/app/public
-      - ./src:/app/src
-      - ./index.html:/app/index.html
+### Development Priorities
 
-  release:
-    build: 
-      context: .
-      dockerfile: ./Dockerfile
-    environment:
-      <<: *environment-vars
-      PORT: 80
-    ports:
-      - 80:80
-```
+1. **Fast feedback**: Code changes should reflect immediately
+2. **Easy debugging**: Source maps, full stack traces
+3. **Simple workflow**: Minimal commands to start working
 
-### Key Patterns
+### Production Priorities
 
-1. **YAML Anchors** (`x-environment-vars: &environment-vars`)
-   - Define shared environment variables once
-   - Reference with `<<: *environment-vars`
-   - Reduces duplication across services
+1. **Small image size**: Faster deploys, less storage
+2. **Security**: Minimal attack surface, no dev tools
+3. **Performance**: Optimized builds, efficient serving
+4. **Reliability**: Graceful handling of signals
 
-2. **Development Service**
-   - Volume mounts for hot reload (`./src:/app/src`)
-   - Maps source directories to container
-   - Changes reflect immediately without rebuild
+### The Two-Dockerfile Approach
 
-3. **Production Service**
-   - No volume mounts (uses built files in image)
-   - Different port mapping (80:80)
-   - Same environment variables as dev
-
-## Custom Node.js Server for Production
-
-### Pattern: SPA Server with Config Endpoint
-
-Production requires a server to:
-1. Serve static files from build
-2. Handle SPA routing (all routes → index.html)
-3. Provide runtime configuration endpoint
-
-```
-server/
-├── index.js          # Server entry point
-└── routes/
-    ├── config.js     # Configuration endpoint
-    └── spa.js        # SPA routing handler
-```
-
-### Server Entry Point
-
-```javascript
-// server/index.js
-import Hapi from '@hapi/hapi';
-import Inert from '@hapi/inert';
-import path from 'path';
-import dotenv from 'dotenv';
-import fs from 'fs';
-import spaRoute from './routes/spa.js';
-import configRoute from './routes/config.js';
-
-function getServerVersion() {
-  const packageJsonPath = path.resolve('/app/package.json');
-  const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
-  return packageJson.version;
-}
-
-async function init() {
-  dotenv.config();
-  const { PORT } = process.env;
-
-  const server = Hapi.server({
-    port: PORT || 80,
-    host: '0.0.0.0',
-  });
-
-  await server.register(Inert);
-
-  const routes = [
-    configRoute,
-    spaRoute,
-  ];
-
-  server.route(routes);
-
-  const version = getServerVersion();
-  const startMessage = `App v${version} running on ${server.info.uri}`;
-
-  await server.start();
-  console.log(startMessage);
-}
-
-process.on('unhandledRejection', (err) => {
-  console.log(err);
-  process.exit(1);
-});
-
-init();
-```
-
-### Configuration Route
-
-```javascript
-// server/routes/config.js
-const { VITE_HOST } = process.env;
-
-export default {
-  method: 'GET',
-  path: '/mw/config',
-  handler: (request, h) => {
-    const config = {
-      VITE_API_BASE_URL: process.env.VITE_API_BASE_URL,
-      VITE_BUILD_BASE_URL: process.env.VITE_BUILD_BASE_URL,
-      VITE_BUILD_VERSION: process.env.VITE_BUILD_VERSION,
-      VITE_CHARACTER_FBX_URL: process.env.VITE_CHARACTER_FBX_URL,
-      VITE_DOWNLOAD_URL: process.env.VITE_DOWNLOAD_URL,
-      VITE_DISCORD_URL: process.env.VITE_DISCORD_URL
-    };
-
-    return h.response(config).code(200);
-  },
-  options: {
-    cors: {
-      origin: [ VITE_HOST ]
-    }
-  }
-};
-```
-
-**Purpose**: Expose environment variables to the client at runtime (not build time).
-
-### SPA Route Handler
-
-```javascript
-// server/routes/spa.js
-import path from 'path';
-import Boom from '@hapi/boom';
-
-export default {
-  method: 'GET',
-  path: '/{param*}',
-  handler: {
-    directory: {
-      path: path.resolve('/app/dist'),
-      index: ['index.html'],
-      redirectToSlash: true
-    },
-  },
-  options: {
-    ext: {
-      onPreResponse: {
-        method(request, h) {
-          const isMiddlewareRequest = request.path.toLowerCase().trim().startsWith('/mw');
-          const { response } = request;
-
-          // If the response is a 404
-          if (response.isBoom && response.output.statusCode === 404) {
-            // If the request is for a middleware route, return a 404
-            if (isMiddlewareRequest) {
-              return Boom.notFound("Not Found");
-            }
-
-            // Serve the index.html file to support deep linking
-            const filePath = path.resolve('/app/dist/index.html');
-            return h.file(filePath);
-          }
-
-          // Continue with the response if inert found it
-          return h.continue;
-        },
-      }
-    }
-  }
-};
-```
-
-**Purpose**: 
-- Serve static files from `/app/dist`
-- Return `index.html` for 404s (enables client-side routing)
-- Preserve 404s for API/middleware routes (`/mw/*`)
-
-## File Structure
-
-```
-project-root/
-├── Dockerfile              # Production multi-stage build
-├── Dockerfile.dev          # Development with hot reload
-├── docker-compose.yml      # Service orchestration
-├── server/                 # Custom Node.js server
-│   ├── index.js           # Server entry
-│   └── routes/
-│       ├── config.js      # Runtime config endpoint
-│       └── spa.js         # SPA fallback handler
-├── src/                   # Application source
-├── public/                # Static assets
-├── package.json
-└── vite.config.js         # Build configuration
-```
-
-## Usage Commands
-
-### Development
-
-```bash
-# Build and run development container
-docker-compose up dev
-
-# Or with environment file
-docker-compose --env-file .env.dev up dev
-
-# Stop
-docker-compose down
-```
-
-### Production
-
-```bash
-# Build production image
-docker build -f Dockerfile -t myapp:latest .
-
-# Run production container
-docker run -p 80:80 \
-  -e VITE_API_BASE_URL=https://api.example.com \
-  -e VITE_BUILD_VERSION=1.0.0 \
-  myapp:latest
-
-# Or use docker-compose
-docker-compose up release
-```
-
-## Environment Variable Strategy
-
-### Development
-- Variables passed from host `.env` file
-- Injected at container runtime
-- Accessible via `import.meta.env` in Vite
-
-### Production
-- Variables passed as Docker environment variables
-- Server exposes them via `/mw/config` endpoint
-- Client fetches config before rendering
-- Enables environment-agnostic builds (same image, different configs)
-
-### Client-Side Configuration Loading
-
-```javascript
-// In client app before rendering
-async function getConfig() {
-  const response = await fetch('/mw/config');
-  const config = await response.json();
-  
-  // Store in localStorage or context
-  Object.keys(config).forEach(key => {
-    localStorage.setItem(key, config[key]);
-  });
-}
-
-await getConfig();
-// Now render app
-```
-
-## Benefits of This Pattern
-
-1. **Optimized Production Images**
-   - Multi-stage builds = smaller images
-   - No build dependencies in final image
-   - Faster deployments and reduced attack surface
-
-2. **Development Parity**
-   - Same environment variables across dev/prod
-   - Containerized dev environment matches production
-   - Volume mounts enable hot reload
-
-3. **Runtime Configuration**
-   - Same Docker image for multiple environments
-   - No rebuild needed to change API URLs
-   - Configuration lives outside the build
-
-4. **SPA Support**
-   - Client-side routing works with deep links
-   - Static assets served efficiently
-   - Clean separation of middleware/static routes
-
-## Alternative Patterns
-
-### Nginx for Production
-Instead of Node.js server, use Nginx:
-
+**Dockerfile.dev** - Optimized for development:
 ```dockerfile
-# Production stage
+FROM node:20-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+CMD ["npm", "run", "dev"]
+```
+
+**Dockerfile** - Optimized for production:
+```dockerfile
+FROM node:20-alpine AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
 FROM nginx:alpine
 COPY --from=build /app/dist /usr/share/nginx/html
-COPY nginx.conf /etc/nginx/nginx.conf
-EXPOSE 80
-CMD ["nginx", "-g", "daemon off;"]
 ```
 
-**When to use**: 
-- No need for runtime configuration endpoint
-- Pure static site hosting
-- Maximum performance for static files
+Use Docker Compose to select which to use:
+```yaml
+services:
+  dev:
+    build:
+      dockerfile: Dockerfile.dev
+    volumes:
+      - ./src:/app/src
 
-### Express Server
-Alternative to Hapi:
-
-```javascript
-import express from 'express';
-import path from 'path';
-
-const app = express();
-const PORT = process.env.PORT || 80;
-
-// Config endpoint
-app.get('/mw/config', (req, res) => {
-  res.json({
-    VITE_API_BASE_URL: process.env.VITE_API_BASE_URL,
-    // ... other vars
-  });
-});
-
-// Static files
-app.use(express.static(path.resolve('/app/dist')));
-
-// SPA fallback
-app.get('*', (req, res) => {
-  res.sendFile(path.resolve('/app/dist/index.html'));
-});
-
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on port ${PORT}`);
-});
+  production:
+    build:
+      dockerfile: Dockerfile
 ```
 
-## Best Practices
+## Volume Mounts for Development
 
-1. **Use alpine base images** for smaller size
-2. **Copy package files first** to leverage layer caching
-3. **Use npm ci** instead of npm install for reproducible builds
-4. **WORKDIR** for explicit working directory
-5. **EXPOSE** to document port usage
-6. **Volume mount source in dev** for hot reload
-7. **Separate Dockerfiles** for dev/prod clarity
-8. **Environment variable anchors** in compose files
-9. **Health checks** for production containers
-10. **.dockerignore** to exclude node_modules, .git, etc.
+### The Hot Reload Pattern
 
-## Sample .dockerignore
+Without volumes, changing code requires rebuilding the image. With volumes, changes sync instantly:
+
+```yaml
+services:
+  app:
+    build:
+      dockerfile: Dockerfile.dev
+    volumes:
+      - ./src:/app/src        # Mount source code
+      - ./public:/app/public  # Mount static assets
+```
+
+**How it works**:
+1. Container starts with code copied during build
+2. Volume mount overlays local `./src` onto container's `/app/src`
+3. File watcher in container sees local changes
+4. Application reloads automatically
+
+### What NOT to Mount
+
+**Don't mount node_modules**:
+```yaml
+volumes:
+  - ./:/app                    # Mounts everything including node_modules
+  - /app/node_modules          # "Anonymous volume" to mask the mount
+```
+
+**Why?**
+- node_modules may have platform-specific binaries (macOS vs Linux)
+- Syncing thousands of small files is slow
+- Dependencies should be installed inside the container
+
+**Better approach**:
+```yaml
+volumes:
+  - ./src:/app/src             # Only mount what needs hot reload
+  - ./public:/app/public
+```
+
+## Docker Compose Patterns
+
+### Service Definition
+
+```yaml
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "8000:8000"           # host:container
+    environment:
+      - DATABASE_URL=postgres://db:5432/myapp
+    depends_on:
+      - db
+    volumes:
+      - ./src:/app/src
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_PASSWORD=secret
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+volumes:
+  db_data:
+```
+
+### Environment Variables
+
+**Three ways to provide them**:
+
+1. **In docker-compose.yaml** (visible in version control):
+```yaml
+environment:
+  - NODE_ENV=development
+  - LOG_LEVEL=debug
+```
+
+2. **From shell environment**:
+```yaml
+environment:
+  - DATABASE_URL  # Uses value from shell
+```
+
+3. **From .env file** (recommended for secrets):
+```yaml
+# docker-compose.yaml
+environment:
+  - DATABASE_URL=${DATABASE_URL}
+
+# .env
+DATABASE_URL=postgres://user:pass@host:5432/db
+```
+
+### YAML Anchors for DRY Configuration
+
+```yaml
+x-common-env: &common-env
+  NODE_ENV: production
+  LOG_LEVEL: info
+
+services:
+  api:
+    environment:
+      <<: *common-env
+      API_PORT: 8000
+
+  worker:
+    environment:
+      <<: *common-env
+      WORKER_CONCURRENCY: 4
+```
+
+**How it works**:
+- `&common-env` defines an anchor (a reusable block)
+- `*common-env` references the anchor
+- `<<:` merges the anchor's contents
+
+### Networking
+
+**Default behavior**: All services in a compose file can reach each other by service name.
+
+```yaml
+services:
+  api:
+    # Can connect to "db:5432"
+  db:
+    # Can be reached at "db"
+```
+
+**Custom networks** for isolation:
+```yaml
+services:
+  frontend:
+    networks:
+      - frontend-net
+
+  api:
+    networks:
+      - frontend-net  # Reachable by frontend
+      - backend-net   # Reachable by db
+
+  db:
+    networks:
+      - backend-net   # NOT reachable by frontend
+
+networks:
+  frontend-net:
+  backend-net:
+```
+
+## .dockerignore
+
+### Why It Matters
+
+Without `.dockerignore`, `COPY . .` copies everything:
+- node_modules (hundreds of MB, wrong platform)
+- .git (potentially large history)
+- Local environment files (.env with secrets)
+- Build artifacts (dist/, coverage/)
+
+### Recommended .dockerignore
 
 ```
+# Dependencies (installed in container)
 node_modules
+vendor
+
+# Version control
 .git
 .gitignore
-*.md
+
+# Environment files (may contain secrets)
 .env
 .env.*
+!.env.example
+
+# Build artifacts
 dist
+build
 coverage
+*.log
+
+# IDE
 .vscode
 .idea
-*.log
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
 ```
+
+## Health Checks
+
+### Container Health
+
+Docker can monitor container health:
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:8000/health || exit 1
+```
+
+**Parameters**:
+- `--interval`: How often to check
+- `--timeout`: How long to wait for response
+- `--start-period`: Grace period for container startup
+- `--retries`: Failures before marking unhealthy
+
+### In Docker Compose
+
+```yaml
+services:
+  api:
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+```
+
+**Why health checks matter**:
+- Load balancers route only to healthy instances
+- Orchestrators restart unhealthy containers
+- `depends_on` with `condition: service_healthy` waits for actual readiness
+
+## Best Practices Summary
+
+### Image Building
+
+1. **Order instructions for caching** - Least-changing first
+2. **Use multi-stage builds** - Separate build from runtime
+3. **Choose appropriate base images** - Alpine for size, full images for compatibility
+4. **Use .dockerignore** - Don't copy unnecessary files
+
+### Development
+
+5. **Mount source code** - Enable hot reload
+6. **Don't mount node_modules** - Install inside container
+7. **Use Dockerfile.dev** - Development-specific configuration
+
+### Production
+
+8. **Minimize image size** - Smaller = faster + more secure
+9. **Don't run as root** - Use `USER` instruction
+10. **Add health checks** - Enable proper orchestration
+11. **Handle signals** - Graceful shutdown in your application
+
+### Docker Compose
+
+12. **Use .env files** - Keep secrets out of version control
+13. **Named volumes for data** - Persist across container restarts
+14. **YAML anchors** - Reduce duplication
+15. **Explicit networks** - Control service visibility

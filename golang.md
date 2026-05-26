@@ -1,823 +1,560 @@
 # Go API Development
 
-Patterns for building REST APIs in Go using gorilla/mux router, repository pattern, and standard library conventions.
+This guide covers patterns for building REST APIs in Go, focusing on architectural decisions and the reasoning behind common patterns. The examples use gorilla/mux for routing, but the principles apply to any router.
 
-## Project Structure
+## Why Go for APIs?
+
+### Go's Strengths
+
+1. **Simple concurrency**: Goroutines and channels make concurrent operations straightforward
+2. **Fast compilation**: Quick feedback during development
+3. **Static binaries**: Deploy a single file with no runtime dependencies
+4. **Strong standard library**: `net/http` is production-ready out of the box
+5. **Explicit error handling**: Errors are values, not exceptions
+
+### When Go Fits Well
+
+- High-throughput APIs needing concurrent request handling
+- Microservices that benefit from small container images
+- Teams that value explicit code over magic
+- Systems where deployment simplicity matters
+
+## Project Structure Philosophy
+
+### The pkg/ Layout
 
 ```
-project-root/
-├── main.go                 # Application entry point
-├── go.mod                  # Go module definition
-├── go.sum                  # Dependency checksums
-├── .env                    # Environment variables
-├── migrations/             # Database migrations
-│   ├── 000001_init_schema.up.sql
-│   └── 000001_init_schema.down.sql
+myapi/
+├── main.go                 # Entry point - minimal, just wiring
+├── go.mod
+├── go.sum
 └── pkg/
-    ├── database/           # Database connection
-    │   └── database.go
-    ├── errors/             # Error utilities
-    │   └── errors.go
-    ├── handlers/           # HTTP handlers
-    │   ├── health.go
-    │   ├── projects.go
-    │   └── response.go     # Response helpers
-    ├── middleware/         # HTTP middleware
-    │   ├── logger.go
-    │   └── cors.go
-    ├── models/             # Data models
-    │   ├── project.go
-    │   └── errors.go       # Domain errors
-    ├── repository/         # Data access layer
-    │   └── project.go
-    ├── router/             # Route configuration
-    │   └── router.go
     ├── server/             # HTTP server setup
-    │   └── server.go
-    └── services/           # Business logic (optional)
-        └── workflow.go
+    ├── router/             # Route definitions
+    ├── handlers/           # HTTP request handlers
+    ├── middleware/         # HTTP middleware
+    ├── models/             # Domain types and DTOs
+    ├── repository/         # Data access layer
+    ├── services/           # Business logic (optional)
+    ├── database/           # Database connection
+    └── errors/             # Error utilities
 ```
 
-## Module Setup
+**Why this structure?**
 
-### go.mod
+1. **Separation of concerns**: Each package has one job
+2. **Dependency direction**: Dependencies flow inward (handlers → repository → database)
+3. **Testability**: Each layer can be tested independently with mocks
+4. **Replaceability**: Swap PostgreSQL for MongoDB by changing only the repository layer
 
-```go
-module github.com/username/myapp
+### The Layered Architecture
 
-go 1.21
-
-require (
-	github.com/gorilla/mux v1.8.1
-	github.com/lib/pq v1.10.9
-)
+```
+┌─────────────┐
+│   Handlers  │  ← HTTP concerns: parse requests, format responses
+├─────────────┤
+│  Services   │  ← Business logic (optional for simple CRUD)
+├─────────────┤
+│ Repository  │  ← Data access: queries, transactions
+├─────────────┤
+│  Database   │  ← Connection management
+└─────────────┘
 ```
 
-**Key Points**:
-- Module path should match your repository
-- Use Go 1.21+ for latest features
-- `gorilla/mux` for HTTP routing
-- `lib/pq` for PostgreSQL driver
+**Handlers** translate between HTTP and your domain. They:
+- Parse request bodies and URL parameters
+- Validate input
+- Call services or repositories
+- Format responses
 
-## Application Entry
+**Repositories** abstract data access. They:
+- Execute database queries
+- Map database rows to domain types
+- Handle database-specific errors
 
-### main.go
+**Services** contain business logic. They:
+- Orchestrate multiple repository calls
+- Enforce business rules
+- Handle transactions
+
+For simple CRUD operations, handlers can call repositories directly. Add services when business logic becomes complex.
+
+## Dependency Injection Pattern
+
+### The Problem
+
+Hardcoded dependencies make code hard to test and modify:
 
 ```go
-package main
+// Bad: Hardcoded dependency
+func (h *Handler) GetUser(w http.ResponseWriter, r *http.Request) {
+    db, _ := sql.Open("postgres", "...")  // Can't mock this
+    // ...
+}
+```
 
-import (
-	"log"
-	"os"
+### Constructor Injection
 
-	"github.com/username/myapp/pkg/database"
-	"github.com/username/myapp/pkg/server"
-)
+Pass dependencies through constructors:
 
+```go
+// Repository depends on database connection
+type UserRepository struct {
+    db *sql.DB
+}
+
+func NewUserRepository(db *sql.DB) *UserRepository {
+    return &UserRepository{db: db}
+}
+
+// Handler depends on repository
+type UserHandler struct {
+    repo *UserRepository
+}
+
+func NewUserHandler(repo *UserRepository) *UserHandler {
+    return &UserHandler{repo: repo}
+}
+```
+
+**Benefits**:
+- Dependencies are explicit in the constructor signature
+- Easy to mock for testing: pass a mock repository
+- Clear initialization order in main.go
+
+### Wiring in main.go
+
+```go
 func main() {
-	// Get port from environment
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8000"
-	}
+    // Initialize dependencies from bottom up
+    db, err := database.New(config)
+    if err != nil {
+        log.Fatalf("database connection failed: %v", err)
+    }
+    defer db.Close()
 
-	// Connect to database
-	db, err := database.NewFromEnv()
-	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
-	}
-	defer db.Close()
+    // Build the dependency tree
+    userRepo := repository.NewUserRepository(db)
+    userHandler := handlers.NewUserHandler(userRepo)
 
-	log.Println("Connected to database")
+    // Wire up routes
+    router := setupRoutes(userHandler)
 
-	// Create and start server
-	srv, err := server.New(port, db.DB)
-	if err != nil {
-		log.Fatalf("Failed to create server: %v", err)
-	}
-
-	log.Printf("Starting server on port %s", port)
-	if err := srv.Start(); err != nil {
-		log.Fatalf("Server error: %v", err)
-	}
+    // Start server
+    server := &http.Server{
+        Addr:    ":8000",
+        Handler: router,
+    }
+    log.Fatal(server.ListenAndServe())
 }
 ```
 
-**Key Points**:
-- Environment variables for configuration
-- Defer database close
-- Structured error handling with `log.Fatalf`
-- Clean separation of concerns
+## Handler Patterns
 
-## Server Setup
-
-### pkg/server/server.go
+### Anatomy of a Handler
 
 ```go
-package server
+func (h *UserHandler) Create(w http.ResponseWriter, r *http.Request) {
+    // 1. Parse and validate input
+    var input CreateUserInput
+    if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+        respondError(w, http.StatusBadRequest, "invalid JSON")
+        return
+    }
 
-import (
-	"context"
-	"database/sql"
-	"fmt"
-	"net/http"
-	"os"
-	"os/signal"
-	"syscall"
-	"time"
+    if input.Email == "" {
+        respondError(w, http.StatusBadRequest, "email is required")
+        return
+    }
 
-	"github.com/username/myapp/pkg/errors"
-	"github.com/username/myapp/pkg/router"
-)
+    // 2. Call business logic
+    user, err := h.repo.Create(r.Context(), input)
+    if err != nil {
+        // 3. Handle domain errors appropriately
+        if errors.Is(err, ErrEmailTaken) {
+            respondError(w, http.StatusConflict, "email already registered")
+            return
+        }
+        log.Printf("failed to create user: %v", err)
+        respondError(w, http.StatusInternalServerError, "internal error")
+        return
+    }
 
-// Server represents the HTTP server
-type Server struct {
-	httpServer *http.Server
-	port       string
-	db         *sql.DB
-}
-
-// New creates a new server instance
-func New(port string, db *sql.DB) (*Server, error) {
-	if port == "" {
-		return nil, errors.New("port is required")
-	}
-	if db == nil {
-		return nil, errors.New("database connection is required")
-	}
-
-	r := router.New(db)
-
-	srv := &Server{
-		httpServer: &http.Server{
-			Addr:         fmt.Sprintf(":%s", port),
-			Handler:      r,
-			ReadTimeout:  15 * time.Second,
-			WriteTimeout: 15 * time.Second,
-			IdleTimeout:  60 * time.Second,
-		},
-		port: port,
-		db:   db,
-	}
-
-	return srv, nil
-}
-
-// Start starts the HTTP server with graceful shutdown
-func (s *Server) Start() error {
-	// Channel to listen for errors from the server
-	serverErrors := make(chan error, 1)
-
-	// Start the server
-	go func() {
-		serverErrors <- s.httpServer.ListenAndServe()
-	}()
-
-	// Channel to listen for interrupt or terminate signals
-	shutdown := make(chan os.Signal, 1)
-	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
-
-	// Block until we receive a signal or an error
-	select {
-	case err := <-serverErrors:
-		return errors.Wrap(err, "server error")
-
-	case sig := <-shutdown:
-		fmt.Printf("\nReceived signal: %v. Starting graceful shutdown...\n", sig)
-
-		// Give outstanding requests 20 seconds to complete
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-
-		if err := s.httpServer.Shutdown(ctx); err != nil {
-			s.httpServer.Close()
-			return errors.Wrap(err, "failed to gracefully shutdown server")
-		}
-	}
-
-	return nil
+    // 4. Format response
+    respondJSON(w, http.StatusCreated, user)
 }
 ```
 
-**Key Points**:
-- Configurable timeouts prevent resource exhaustion
-- Graceful shutdown allows in-flight requests to complete
-- Signal handling for Docker/Kubernetes deployments
+**Key principles**:
 
-## Router Configuration
+1. **Validate early**: Check input before doing work
+2. **Use context**: Pass `r.Context()` to enable request cancellation
+3. **Distinguish error types**: Client errors (4xx) vs server errors (5xx)
+4. **Log internally, respond generically**: Log details for debugging, send safe messages to clients
 
-### pkg/router/router.go
+### Response Helpers
+
+Consistent response formatting:
 
 ```go
-package router
+func respondJSON(w http.ResponseWriter, status int, data interface{}) {
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(status)
+    json.NewEncoder(w).Encode(data)
+}
 
-import (
-	"database/sql"
-	"net/http"
-
-	"github.com/gorilla/mux"
-	"github.com/username/myapp/pkg/handlers"
-	"github.com/username/myapp/pkg/middleware"
-	"github.com/username/myapp/pkg/repository"
-)
-
-// New creates and configures a new router
-func New(db *sql.DB) *mux.Router {
-	r := mux.NewRouter()
-
-	// Global middleware
-	r.Use(middleware.Logger)
-	r.Use(middleware.CORS)
-
-	// Health check
-	r.HandleFunc("/health", handlers.HealthCheck).Methods(http.MethodGet)
-
-	// Initialize repositories
-	projectRepo := repository.NewProjectRepository(db)
-
-	// Initialize handlers
-	projectHandler := handlers.NewProjectHandler(projectRepo)
-
-	// Project routes
-	// UUID regex pattern for path parameters
-	uuidPattern := "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
-
-	r.HandleFunc("/projects", projectHandler.Create).Methods(http.MethodPost, http.MethodOptions)
-	r.HandleFunc("/projects", projectHandler.List).Methods(http.MethodGet, http.MethodOptions)
-	r.HandleFunc("/projects/{id:"+uuidPattern+"}", projectHandler.Get).Methods(http.MethodGet, http.MethodOptions)
-	r.HandleFunc("/projects/{id:"+uuidPattern+"}", projectHandler.Update).Methods(http.MethodPut, http.MethodOptions)
-	r.HandleFunc("/projects/{id:"+uuidPattern+"}", projectHandler.Delete).Methods(http.MethodDelete, http.MethodOptions)
-
-	return r
+func respondError(w http.ResponseWriter, status int, message string) {
+    respondJSON(w, status, map[string]string{"error": message})
 }
 ```
 
-**Key Points**:
-- Middleware applied with `r.Use()`
-- UUID validation with regex in route
-- `http.MethodOptions` for CORS preflight
-- Dependency injection through constructors
+**Why helpers?**
+- Consistent Content-Type header
+- Consistent error format across all endpoints
+- Less repetition in handlers
 
-## Middleware
+### HTTP Status Codes
 
-### pkg/middleware/logger.go
+Choose meaningful status codes:
 
-```go
-package middleware
-
-import (
-	"log"
-	"net/http"
-	"time"
-)
-
-// responseWriter wraps http.ResponseWriter to capture status code
-type responseWriter struct {
-	http.ResponseWriter
-	statusCode int
-}
-
-func (rw *responseWriter) WriteHeader(code int) {
-	rw.statusCode = code
-	rw.ResponseWriter.WriteHeader(code)
-}
-
-// Logger logs HTTP requests
-func Logger(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-
-		rw := &responseWriter{
-			ResponseWriter: w,
-			statusCode:     http.StatusOK,
-		}
-
-		next.ServeHTTP(rw, r)
-
-		log.Printf(
-			"%s %s %d %s",
-			r.Method,
-			r.RequestURI,
-			rw.statusCode,
-			time.Since(start),
-		)
-	})
-}
-```
-
-### pkg/middleware/cors.go
-
-```go
-package middleware
-
-import (
-	"net/http"
-	"os"
-	"strings"
-)
-
-// CORS handles Cross-Origin Resource Sharing
-func CORS(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Get allowed origins from environment
-		allowedOrigins := os.Getenv("ALLOWED_ORIGINS")
-		origins := strings.Split(allowedOrigins, ",")
-
-		origin := r.Header.Get("Origin")
-		for _, allowed := range origins {
-			if origin == strings.TrimSpace(allowed) {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-				break
-			}
-		}
-
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
-
-		// Handle preflight
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-```
-
-## Models
-
-### pkg/models/project.go
-
-```go
-package models
-
-import "time"
-
-// Project represents a project entity
-type Project struct {
-	ID        string    `json:"id" db:"id"`
-	Name      string    `json:"name" db:"name"`
-	Summary   string    `json:"summary" db:"summary"`
-	Status    string    `json:"status" db:"status"`
-	CreatedAt time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
-}
-
-// CreateProjectRequest represents the request to create a project
-type CreateProjectRequest struct {
-	Name    string `json:"name"`
-	Summary string `json:"summary"`
-}
-
-// UpdateProjectRequest represents the request to update a project
-type UpdateProjectRequest struct {
-	Name    string `json:"name"`
-	Summary string `json:"summary"`
-	Status  string `json:"status"`
-}
-```
-
-**Key Points**:
-- Struct tags for JSON serialization
-- Separate request/response types from domain models
-- `db` tags for database mapping (if using sqlx)
-
-### pkg/models/errors.go
-
-```go
-package models
-
-import "errors"
-
-// Domain errors
-var (
-	ErrProjectNotFound = errors.New("project not found")
-	ErrBriefNotFound   = errors.New("brief not found")
-)
-```
+| Status | When to Use |
+|--------|-------------|
+| 200 OK | Successful GET, PUT that returns data |
+| 201 Created | Successful POST that creates a resource |
+| 204 No Content | Successful DELETE or PUT that doesn't return data |
+| 400 Bad Request | Malformed request (invalid JSON, missing field) |
+| 401 Unauthorized | Missing or invalid authentication |
+| 403 Forbidden | Authenticated but not authorized |
+| 404 Not Found | Resource doesn't exist |
+| 409 Conflict | Resource state conflict (duplicate email) |
+| 500 Internal Server Error | Server-side failure |
 
 ## Repository Pattern
 
-### pkg/repository/project.go
+### Why Repositories?
+
+Repositories provide an abstraction over data access:
 
 ```go
-package repository
-
-import (
-	"context"
-	"database/sql"
-
-	"github.com/username/myapp/pkg/errors"
-	"github.com/username/myapp/pkg/models"
-)
-
-// ProjectRepository handles project data operations
-type ProjectRepository struct {
-	db *sql.DB
+// Without repository - database concerns leak into handlers
+func (h *Handler) GetUser(w http.ResponseWriter, r *http.Request) {
+    var user User
+    err := h.db.QueryRowContext(r.Context(),
+        "SELECT id, name, email FROM users WHERE id = $1",
+        id,
+    ).Scan(&user.ID, &user.Name, &user.Email)
+    // Handler knows SQL, table names, column mapping...
 }
 
-// NewProjectRepository creates a new project repository
-func NewProjectRepository(db *sql.DB) *ProjectRepository {
-	return &ProjectRepository{db: db}
-}
-
-// Create creates a new project
-func (r *ProjectRepository) Create(ctx context.Context, req *models.CreateProjectRequest) (*models.Project, error) {
-	query := `
-		INSERT INTO projects (name, summary)
-		VALUES ($1, $2)
-		RETURNING id, name, summary, status, created_at, updated_at
-	`
-
-	var project models.Project
-	err := r.db.QueryRowContext(ctx, query, req.Name, req.Summary).Scan(
-		&project.ID,
-		&project.Name,
-		&project.Summary,
-		&project.Status,
-		&project.CreatedAt,
-		&project.UpdatedAt,
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to create project")
-	}
-
-	return &project, nil
-}
-
-// GetByID retrieves a project by ID
-func (r *ProjectRepository) GetByID(ctx context.Context, id string) (*models.Project, error) {
-	query := `
-		SELECT id, name, summary, status, created_at, updated_at
-		FROM projects
-		WHERE id = $1
-	`
-
-	var project models.Project
-	err := r.db.QueryRowContext(ctx, query, id).Scan(
-		&project.ID,
-		&project.Name,
-		&project.Summary,
-		&project.Status,
-		&project.CreatedAt,
-		&project.UpdatedAt,
-	)
-	if err == sql.ErrNoRows {
-		return nil, models.ErrProjectNotFound
-	}
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get project")
-	}
-
-	return &project, nil
-}
-
-// List retrieves all projects
-func (r *ProjectRepository) List(ctx context.Context) ([]*models.Project, error) {
-	query := `
-		SELECT id, name, summary, status, created_at, updated_at
-		FROM projects
-		ORDER BY created_at DESC
-	`
-
-	rows, err := r.db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to list projects")
-	}
-	defer rows.Close()
-
-	var projects []*models.Project
-	for rows.Next() {
-		var project models.Project
-		if err := rows.Scan(
-			&project.ID,
-			&project.Name,
-			&project.Summary,
-			&project.Status,
-			&project.CreatedAt,
-			&project.UpdatedAt,
-		); err != nil {
-			return nil, errors.Wrap(err, "failed to scan project")
-		}
-		projects = append(projects, &project)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, errors.Wrap(err, "error iterating projects")
-	}
-
-	return projects, nil
-}
-
-// Update updates a project
-func (r *ProjectRepository) Update(ctx context.Context, id string, req *models.UpdateProjectRequest) (*models.Project, error) {
-	query := `
-		UPDATE projects
-		SET name = $1, summary = $2, status = $3
-		WHERE id = $4
-		RETURNING id, name, summary, status, created_at, updated_at
-	`
-
-	var project models.Project
-	err := r.db.QueryRowContext(ctx, query, req.Name, req.Summary, req.Status, id).Scan(
-		&project.ID,
-		&project.Name,
-		&project.Summary,
-		&project.Status,
-		&project.CreatedAt,
-		&project.UpdatedAt,
-	)
-	if err == sql.ErrNoRows {
-		return nil, models.ErrProjectNotFound
-	}
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to update project")
-	}
-
-	return &project, nil
-}
-
-// Delete deletes a project
-func (r *ProjectRepository) Delete(ctx context.Context, id string) error {
-	query := `DELETE FROM projects WHERE id = $1`
-
-	result, err := r.db.ExecContext(ctx, query, id)
-	if err != nil {
-		return errors.Wrap(err, "failed to delete project")
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return errors.Wrap(err, "failed to get rows affected")
-	}
-
-	if rowsAffected == 0 {
-		return models.ErrProjectNotFound
-	}
-
-	return nil
+// With repository - handler only knows domain operations
+func (h *Handler) GetUser(w http.ResponseWriter, r *http.Request) {
+    user, err := h.repo.FindByID(r.Context(), id)
+    // Handler doesn't know or care how data is stored
 }
 ```
 
-**Key Points**:
-- Accept `context.Context` for cancellation/timeouts
-- Use `RETURNING` to get updated data
-- Handle `sql.ErrNoRows` for not found cases
-- Always `defer rows.Close()` for queries
-- Check `rows.Err()` after iteration
+**Benefits**:
+- **Testability**: Mock the repository interface, not the database
+- **Flexibility**: Change database without changing handlers
+- **Encapsulation**: SQL stays in one place
 
-## Handlers
-
-### pkg/handlers/response.go
+### Repository Structure
 
 ```go
-package handlers
-
-import (
-	"encoding/json"
-	"net/http"
-)
-
-// respondJSON writes a JSON response
-func respondJSON(w http.ResponseWriter, status int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
+type UserRepository struct {
+    db *sql.DB
 }
 
-// respondError writes an error response
-func respondError(w http.ResponseWriter, status int, message string) {
-	respondJSON(w, status, map[string]string{"error": message})
+func NewUserRepository(db *sql.DB) *UserRepository {
+    return &UserRepository{db: db}
+}
+
+func (r *UserRepository) FindByID(ctx context.Context, id string) (*User, error) {
+    query := `SELECT id, name, email, created_at FROM users WHERE id = $1`
+
+    var user User
+    err := r.db.QueryRowContext(ctx, query, id).Scan(
+        &user.ID,
+        &user.Name,
+        &user.Email,
+        &user.CreatedAt,
+    )
+
+    if err == sql.ErrNoRows {
+        return nil, ErrUserNotFound  // Domain error, not SQL error
+    }
+    if err != nil {
+        return nil, fmt.Errorf("query failed: %w", err)
+    }
+
+    return &user, nil
 }
 ```
 
-### pkg/handlers/health.go
+### Domain vs Database Errors
+
+Translate database errors to domain errors:
 
 ```go
-package handlers
-
-import (
-	"encoding/json"
-	"net/http"
+// Domain errors - handlers understand these
+var (
+    ErrUserNotFound = errors.New("user not found")
+    ErrEmailTaken   = errors.New("email already taken")
 )
 
-// HealthCheck returns the health status of the API
-func HealthCheck(w http.ResponseWriter, r *http.Request) {
-	response := map[string]string{
-		"status": "healthy",
-	}
+func (r *UserRepository) Create(ctx context.Context, input CreateUserInput) (*User, error) {
+    // ...
+    _, err := r.db.ExecContext(ctx, query, args...)
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(response)
+    if err != nil {
+        // Check for unique constraint violation
+        if isUniqueViolation(err) {
+            return nil, ErrEmailTaken  // Domain error
+        }
+        return nil, fmt.Errorf("insert failed: %w", err)
+    }
+    // ...
 }
 ```
 
-### pkg/handlers/projects.go
+**Why domain errors?**
+- Handlers don't need to know about SQL error codes
+- Error handling is consistent regardless of database
+- Tests can check for domain errors without database
+
+## Middleware
+
+### What Middleware Does
+
+Middleware wraps handlers to add cross-cutting concerns:
+
+```
+Request → Logger → CORS → Auth → Handler → Response
+```
+
+### The Middleware Signature
 
 ```go
-package handlers
+// Middleware takes a handler and returns a wrapped handler
+func Logger(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        start := time.Now()
 
-import (
-	"encoding/json"
-	"log"
-	"net/http"
+        // Call the next handler
+        next.ServeHTTP(w, r)
 
-	"github.com/gorilla/mux"
-	"github.com/username/myapp/pkg/errors"
-	"github.com/username/myapp/pkg/models"
-	"github.com/username/myapp/pkg/repository"
-)
-
-// ProjectHandler handles project requests
-type ProjectHandler struct {
-	repo *repository.ProjectRepository
-}
-
-// NewProjectHandler creates a new project handler
-func NewProjectHandler(repo *repository.ProjectRepository) *ProjectHandler {
-	return &ProjectHandler{repo: repo}
-}
-
-// Create handles POST /projects
-func (h *ProjectHandler) Create(w http.ResponseWriter, r *http.Request) {
-	var req models.CreateProjectRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Printf("Create: failed to decode request body: %v", err)
-		respondError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	// Validate required fields
-	if req.Name == "" {
-		respondError(w, http.StatusBadRequest, "name is required")
-		return
-	}
-
-	project, err := h.repo.Create(r.Context(), &req)
-	if err != nil {
-		log.Printf("Create: failed to create project: %v", err)
-		respondError(w, http.StatusInternalServerError, "failed to create project")
-		return
-	}
-
-	respondJSON(w, http.StatusCreated, project)
-}
-
-// Get handles GET /projects/{id}
-func (h *ProjectHandler) Get(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	id := vars["id"]
-
-	project, err := h.repo.GetByID(r.Context(), id)
-	if err != nil {
-		if errors.Is(err, models.ErrProjectNotFound) {
-			respondError(w, http.StatusNotFound, "project not found")
-			return
-		}
-		log.Printf("Get: failed to get project %s: %v", id, err)
-		respondError(w, http.StatusInternalServerError, "failed to get project")
-		return
-	}
-
-	respondJSON(w, http.StatusOK, project)
-}
-
-// List handles GET /projects
-func (h *ProjectHandler) List(w http.ResponseWriter, r *http.Request) {
-	projects, err := h.repo.List(r.Context())
-	if err != nil {
-		log.Printf("List: failed to list projects: %v", err)
-		respondError(w, http.StatusInternalServerError, "failed to list projects")
-		return
-	}
-
-	respondJSON(w, http.StatusOK, projects)
-}
-
-// Update handles PUT /projects/{id}
-func (h *ProjectHandler) Update(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	id := vars["id"]
-
-	var req models.UpdateProjectRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Printf("Update: failed to decode request body: %v", err)
-		respondError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	project, err := h.repo.Update(r.Context(), id, &req)
-	if err != nil {
-		if errors.Is(err, models.ErrProjectNotFound) {
-			respondError(w, http.StatusNotFound, "project not found")
-			return
-		}
-		log.Printf("Update: failed to update project %s: %v", id, err)
-		respondError(w, http.StatusInternalServerError, "failed to update project")
-		return
-	}
-
-	respondJSON(w, http.StatusOK, project)
-}
-
-// Delete handles DELETE /projects/{id}
-func (h *ProjectHandler) Delete(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	id := vars["id"]
-
-	if err := h.repo.Delete(r.Context(), id); err != nil {
-		if errors.Is(err, models.ErrProjectNotFound) {
-			respondError(w, http.StatusNotFound, "project not found")
-			return
-		}
-		log.Printf("Delete: failed to delete project %s: %v", id, err)
-		respondError(w, http.StatusInternalServerError, "failed to delete project")
-		return
-	}
-
-	w.WriteHeader(http.StatusNoContent)
+        // Log after handler completes
+        log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start))
+    })
 }
 ```
 
-**Key Points**:
-- Use `mux.Vars(r)` to get path parameters
-- Pass `r.Context()` to repository methods
-- Return appropriate HTTP status codes
-- Log errors server-side, return generic messages to clients
-- Check for domain errors like `ErrProjectNotFound`
+### Common Middleware
 
-## Error Utilities
-
-### pkg/errors/errors.go
+**Logging** - Record requests and timing:
 
 ```go
-package errors
+func Logger(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        start := time.Now()
 
-import (
-	"errors"
-	"fmt"
-)
+        // Wrap ResponseWriter to capture status code
+        wrapped := &responseWriter{ResponseWriter: w, statusCode: 200}
 
-// New creates a new error with a message
-func New(message string) error {
-	return errors.New(message)
-}
+        next.ServeHTTP(wrapped, r)
 
-// Wrap wraps an error with additional context
-func Wrap(err error, message string) error {
-	if err == nil {
-		return nil
-	}
-	return fmt.Errorf("%s: %w", message, err)
-}
-
-// Is reports whether any error in err's chain matches target
-func Is(err, target error) bool {
-	return errors.Is(err, target)
+        log.Printf("%s %s %d %s",
+            r.Method,
+            r.URL.Path,
+            wrapped.statusCode,
+            time.Since(start),
+        )
+    })
 }
 ```
 
-**Key Points**:
-- `%w` verb wraps errors (Go 1.13+)
-- `errors.Is` checks error chain
-- Wrap errors with context as they bubble up
+**CORS** - Handle cross-origin requests:
 
-## Best Practices
+```go
+func CORS(allowedOrigins []string) func(http.Handler) http.Handler {
+    originSet := make(map[string]bool)
+    for _, o := range allowedOrigins {
+        originSet[o] = true
+    }
 
-### Code Organization
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            origin := r.Header.Get("Origin")
 
-1. **One package per concern** - database, handlers, models, etc.
-2. **Constructor functions** - `NewXxx()` for initializing structs
-3. **Interface receivers** - Use pointer receivers for methods
-4. **Package-level errors** - Define domain errors in models
+            if originSet[origin] {
+                w.Header().Set("Access-Control-Allow-Origin", origin)
+                w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+                w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            }
+
+            if r.Method == http.MethodOptions {
+                w.WriteHeader(http.StatusOK)
+                return
+            }
+
+            next.ServeHTTP(w, r)
+        })
+    }
+}
+```
+
+### Applying Middleware
+
+With gorilla/mux:
+
+```go
+func setupRouter(h *UserHandler) *mux.Router {
+    r := mux.NewRouter()
+
+    // Apply to all routes
+    r.Use(Logger)
+    r.Use(CORS(allowedOrigins))
+
+    // Routes
+    r.HandleFunc("/users", h.List).Methods("GET")
+    r.HandleFunc("/users", h.Create).Methods("POST")
+
+    return r
+}
+```
+
+## Error Handling Philosophy
+
+### Errors Are Values
+
+Go treats errors as values to be handled, not exceptions to be caught:
+
+```go
+user, err := repo.FindByID(ctx, id)
+if err != nil {
+    // Handle the error explicitly
+}
+```
+
+**Why this approach?**
+- Error handling is visible in the code
+- Can't accidentally ignore errors (linters catch it)
+- Clear control flow - no hidden jumps
+
+### Error Wrapping
+
+Add context as errors bubble up:
+
+```go
+// Repository
+func (r *UserRepository) FindByID(ctx context.Context, id string) (*User, error) {
+    // ...
+    if err != nil {
+        return nil, fmt.Errorf("finding user %s: %w", id, err)
+    }
+}
+
+// Handler
+user, err := h.repo.FindByID(ctx, id)
+if err != nil {
+    // Error message: "finding user abc123: connection refused"
+    log.Printf("GetUser failed: %v", err)
+}
+```
+
+The `%w` verb wraps the error, preserving the original for `errors.Is()` checks.
+
+### Error Checking
+
+```go
+// Check for specific error
+if errors.Is(err, ErrUserNotFound) {
+    respondError(w, http.StatusNotFound, "user not found")
+    return
+}
+
+// Check error type
+var validationErr *ValidationError
+if errors.As(err, &validationErr) {
+    respondError(w, http.StatusBadRequest, validationErr.Message)
+    return
+}
+```
+
+## Graceful Shutdown
+
+### Why It Matters
+
+Without graceful shutdown:
+1. Server receives SIGTERM (container stopping)
+2. Process exits immediately
+3. In-flight requests fail
+
+With graceful shutdown:
+1. Server receives SIGTERM
+2. Stop accepting new requests
+3. Wait for in-flight requests to complete
+4. Then exit
+
+### Implementation
+
+```go
+func main() {
+    server := &http.Server{
+        Addr:    ":8000",
+        Handler: router,
+    }
+
+    // Start server in goroutine
+    go func() {
+        if err := server.ListenAndServe(); err != http.ErrServerClosed {
+            log.Fatalf("server error: %v", err)
+        }
+    }()
+
+    // Wait for interrupt signal
+    quit := make(chan os.Signal, 1)
+    signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+    <-quit
+
+    log.Println("shutting down...")
+
+    // Give in-flight requests time to complete
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+
+    if err := server.Shutdown(ctx); err != nil {
+        log.Printf("shutdown error: %v", err)
+    }
+
+    log.Println("server stopped")
+}
+```
+
+## Best Practices Summary
+
+### Architecture
+
+1. **Layer your code** - Handlers → Services → Repositories → Database
+2. **Inject dependencies** - Pass dependencies through constructors
+3. **Define domain errors** - Translate database errors to domain errors
+
+### Handlers
+
+4. **Validate early** - Check input before doing work
+5. **Use context** - Enable request cancellation
+6. **Choose correct status codes** - 4xx for client errors, 5xx for server errors
+7. **Log internally, respond safely** - Don't expose internal errors to clients
 
 ### Error Handling
 
-5. **Always check errors** - Never ignore returned errors
-6. **Wrap with context** - Add context as errors propagate
-7. **Log and respond** - Log details server-side, return safe messages
-8. **Use sentinel errors** - Define typed errors for specific cases
+8. **Handle every error** - Never ignore returned errors
+9. **Wrap with context** - Use `%w` to add context while preserving the original
+10. **Use sentinel errors** - Define errors like `ErrNotFound` for checking with `errors.Is()`
 
-### HTTP Handlers
+### Production Readiness
 
-9. **Accept context** - Pass `r.Context()` to downstream calls
-10. **Validate input** - Check required fields before processing
-11. **Use appropriate status codes** - 201 Created, 204 No Content, etc.
-12. **Consistent response format** - Standard JSON structure
-
-### Database
-
-13. **Use context** - Accept context for cancellation
-14. **Close rows** - Always `defer rows.Close()`
-15. **Check rows.Err()** - After iterating through rows
-16. **Use RETURNING** - Get updated data in single query
-17. **Parameterized queries** - Use `$1, $2` placeholders (never concatenate)
-
-### Testing
-
-18. **Table-driven tests** - Use `[]struct{}` for test cases
-19. **Test handlers** - Use `httptest.NewRecorder()`
-20. **Mock repositories** - Use interfaces for dependency injection
+11. **Graceful shutdown** - Wait for in-flight requests before exiting
+12. **Health endpoints** - Provide `/health` for load balancer checks
+13. **Structured logging** - Include request IDs and relevant context
+14. **Request timeouts** - Set `ReadTimeout` and `WriteTimeout` on the server

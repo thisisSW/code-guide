@@ -1,245 +1,325 @@
 # TypeScript Fundamentals
 
-TypeScript extends JavaScript with static type checking. This guide covers essential TypeScript patterns for modern web development.
+TypeScript adds static type checking to JavaScript, catching errors at compile time rather than runtime. This guide explains when and why to use TypeScript's features, helping you make informed decisions about typing strategies.
 
 > **Note**: This guide assumes familiarity with JavaScript fundamentals. See [javascript.md](./javascript.md) for async/await, array methods, fetch API, and other JavaScript patterns.
 
-## Core Concepts
+## Why TypeScript?
 
-### Type Annotations
+### The Problem with Dynamic Typing
 
-Add types to variables, function parameters, and return values.
+JavaScript's flexibility is both a strength and a weakness. Consider this common scenario:
+
+```javascript
+function processUser(user) {
+  return user.name.toUpperCase();
+}
+
+// This works fine
+processUser({ name: 'alice' });
+
+// This crashes at runtime - no name property
+processUser({ email: 'alice@example.com' });
+
+// This crashes at runtime - name is undefined
+processUser({});
+```
+
+These bugs only surface when the code runs, often in production. TypeScript catches them immediately:
 
 ```typescript
-// Variables
+interface User {
+  name: string;
+}
+
+function processUser(user: User) {
+  return user.name.toUpperCase();
+}
+
+// TypeScript error: Property 'name' is missing
+processUser({ email: 'alice@example.com' });
+```
+
+### When TypeScript Adds Value
+
+TypeScript provides the most benefit when:
+
+1. **Working in teams** - Types serve as documentation and contracts between developers
+2. **Building APIs** - Request/response types ensure frontend and backend stay synchronized
+3. **Refactoring** - The compiler catches breaking changes across your codebase
+4. **Complex data structures** - Types clarify nested objects and relationships
+5. **Long-lived projects** - Types help future maintainers understand the code
+
+TypeScript may add unnecessary overhead for:
+- Quick prototypes or scripts
+- Very small projects with one developer
+- Projects where the team lacks TypeScript experience
+
+## Type Annotations
+
+### The Basics
+
+Type annotations tell TypeScript what shape data should have. Place them after variable names with a colon:
+
+```typescript
+// Primitives
 const name: string = 'Alice';
 const age: number = 30;
 const isActive: boolean = true;
-const items: string[] = ['apple', 'banana'];
 
-// Function parameters and return types
-function greet(name: string): string {
-  return `Hello, ${name}`;
+// Arrays
+const tags: string[] = ['typescript', 'javascript'];
+const scores: number[] = [95, 87, 92];
+
+// Objects (inline)
+const user: { name: string; age: number } = {
+  name: 'Alice',
+  age: 30,
+};
+```
+
+### When to Annotate vs. When to Infer
+
+TypeScript can infer types from values. Use inference when types are obvious:
+
+```typescript
+// Let TypeScript infer - the type is obvious from the value
+const name = 'Alice';        // TypeScript knows this is string
+const count = 42;            // TypeScript knows this is number
+const items = ['a', 'b'];    // TypeScript knows this is string[]
+
+// Annotate when the type isn't clear from context
+let data: User | null = null;  // Will be assigned later
+const response: ApiResponse<User[]> = await fetchUsers();
+```
+
+**Rule of thumb**: Annotate function parameters and return types. Let TypeScript infer local variables.
+
+### Function Types
+
+Functions benefit most from explicit types because they define contracts:
+
+```typescript
+// Parameters and return type annotated
+function calculateTotal(price: number, quantity: number): number {
+  return price * quantity;
 }
 
-// Arrow functions
-const double = (n: number): number => n * 2;
+// Arrow function with types
+const formatCurrency = (amount: number): string => {
+  return `$${amount.toFixed(2)}`;
+};
 
-// Optional parameters
-function log(message: string, level?: string): void {
-  console.log(level ? `[${level}] ${message}` : message);
+// void means the function returns nothing meaningful
+function logMessage(message: string): void {
+  console.log(message);
+}
+
+// Optional parameters use ?
+function greet(name: string, greeting?: string): string {
+  return `${greeting || 'Hello'}, ${name}`;
 }
 
 // Default parameters
-function createUser(name: string, role: string = 'user'): void {
-  console.log(`${name} is a ${role}`);
+function createUser(name: string, role: string = 'member'): User {
+  return { name, role };
 }
 ```
 
-**Key Points**:
-- Type annotations come after the variable/parameter name with a colon
-- `void` indicates a function returns nothing
-- `?` makes parameters optional
-- TypeScript infers types when possible (you can omit annotations for initialized variables)
+## Interfaces vs. Type Aliases
 
-### Interfaces
+Both define object shapes, but they have different use cases.
 
-Define the shape of objects.
+### Interfaces: For Object Shapes You'll Extend
+
+Use interfaces when defining objects that represent entities in your domain:
 
 ```typescript
-// Basic interface
+// Interface for a domain entity
 interface User {
   id: string;
-  name: string;
   email: string;
-}
-
-// Optional properties
-interface Project {
-  id: string;
   name: string;
-  summary?: string;  // Optional
 }
 
-// Readonly properties
-interface Config {
-  readonly apiUrl: string;
-  readonly version: string;
+// Interfaces can be extended
+interface AdminUser extends User {
+  permissions: string[];
 }
 
-// Nested interfaces
-interface ProductBrief {
-  id: string;
-  project_id: string;
-  problem_statement: string;
-  stakeholder_goals: string;
-  core_requirements: string;
-  mvp_scope: string;
-  created_at: string;
-  updated_at: string;
-}
-
-// Function type in interface
-interface ApiClient {
-  get: (url: string) => Promise<Response>;
-  post: (url: string, data: unknown) => Promise<Response>;
+// Interfaces can be merged (declaration merging)
+// Useful for extending third-party types
+interface Window {
+  analytics: AnalyticsClient;
 }
 ```
 
-**Key Points**:
-- Interfaces define contracts for object shapes
-- Use `?` for optional properties
-- Use `readonly` for immutable properties
-- Interfaces can extend other interfaces with `extends`
+**Why interfaces for entities?** They clearly signal "this is a thing in our system" and can be extended as requirements evolve.
 
-### Type Aliases
+### Type Aliases: For Unions, Computed Types, and Primitives
 
-Create custom type names.
+Use type aliases for everything else:
 
 ```typescript
-// Simple alias
-type ID = string;
+// Union types - a value that could be one of several types
+type Status = 'pending' | 'active' | 'completed' | 'cancelled';
+type Result = Success | Failure;
+type ID = string | number;
 
-// Union types
-type Status = 'pending' | 'active' | 'completed' | 'archived';
-type Result = string | number;
+// Computed types
+type UserKeys = keyof User;  // 'id' | 'email' | 'name'
+type ReadonlyUser = Readonly<User>;
 
-// Object type alias
-type Coordinates = {
-  x: number;
-  y: number;
-};
-
-// Function type alias
-type Callback = (data: string) => void;
-
-// Generic type alias
-type ApiResponse<T> = {
-  data?: T;
-  error?: string;
-};
+// Function types
+type Callback = (error: Error | null, data: string) => void;
+type AsyncOperation<T> = () => Promise<T>;
 ```
 
-**Key Points**:
-- Use `type` for unions, primitives, and simple shapes
-- Use `interface` for objects that may be extended
-- Both can be used interchangeably for object shapes
+**The practical difference**: Interfaces feel like defining "a thing," while types feel like defining "a shape or constraint."
 
-### Request/Response Types
+## Modeling Your Domain
 
-Define types for API interactions.
+### Request and Response Types
 
-```typescript
-// Request types
-interface CreateBriefRequest {
-  problem_statement: string;
-  stakeholder_goals: string;
-  core_requirements: string;
-  mvp_scope: string;
-}
+When building applications that communicate with APIs, define separate types for:
 
-interface UpdateBriefRequest {
-  problem_statement: string;
-  stakeholder_goals: string;
-  core_requirements: string;
-  mvp_scope: string;
-}
-
-// Response types
-interface ApiError {
-  error: string;
-}
-
-interface ApiResponse<T> {
-  data?: T;
-  error?: string;
-}
-
-// Usage in service functions
-async function createBrief(
-  projectId: string,
-  data: CreateBriefRequest
-): Promise<ProductBrief> {
-  const response = await fetch(`/projects/${projectId}/brief`, {
-    method: 'POST',
-    body: JSON.stringify(data),
-  });
-  return await response.json();
-}
-```
-
-### Enums
-
-Define named constants.
+1. **Domain models** - What the entity looks like in your system
+2. **Request types** - What you send to the API
+3. **Response types** - What the API returns (if different from domain model)
 
 ```typescript
-// String enum
-enum WorkItemStatus {
-  Backlog = 'backlog',
-  Todo = 'todo',
-  InProgress = 'in_progress',
-  InReview = 'in_review',
-  Done = 'done',
-}
-
-// Numeric enum
-enum Priority {
-  Low = 1,
-  Medium = 2,
-  High = 3,
-  Critical = 4,
-}
-
-// Usage
-interface WorkItem {
+// Domain model - the full entity
+interface Article {
   id: string;
   title: string;
-  status: WorkItemStatus;
-  priority: Priority;
+  content: string;
+  author: User;
+  publishedAt: Date;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
-const item: WorkItem = {
-  id: '123',
-  title: 'Implement login',
-  status: WorkItemStatus.Todo,
-  priority: Priority.High,
-};
+// Request type - only fields the client provides
+interface CreateArticleRequest {
+  title: string;
+  content: string;
+}
 
-// Check enum value
-if (item.status === WorkItemStatus.Done) {
-  console.log('Item completed');
+// Update request - all fields optional
+interface UpdateArticleRequest {
+  title?: string;
+  content?: string;
 }
 ```
 
-**Key Points**:
-- String enums are preferred for readability and JSON serialization
-- Enums provide autocomplete and type safety
-- Use `const enum` for inline values (smaller bundle)
+**Why separate types?** The API contract is explicit. You can't accidentally send `id` when creating (the server generates it) or omit required fields.
 
-### Generics
+### Enums for Fixed Sets of Values
 
-Create reusable, type-safe components.
+Use enums when a value must be one of a known set:
 
 ```typescript
-// Generic function
-function identity<T>(value: T): T {
-  return value;
+// String enum - preferred for readability and JSON serialization
+enum OrderStatus {
+  Pending = 'pending',
+  Processing = 'processing',
+  Shipped = 'shipped',
+  Delivered = 'delivered',
+  Cancelled = 'cancelled',
 }
 
-const num = identity<number>(42);      // number
-const str = identity<string>('hello'); // string
-const auto = identity(true);           // boolean (inferred)
+// Usage provides autocomplete and type safety
+interface Order {
+  id: string;
+  status: OrderStatus;
+}
 
-// Generic interface
+function canCancel(order: Order): boolean {
+  // TypeScript knows all possible values
+  return order.status === OrderStatus.Pending
+      || order.status === OrderStatus.Processing;
+}
+```
+
+**Why string enums?** When serialized to JSON (for APIs), you get readable values like `"pending"` instead of `0`. They're also easier to debug.
+
+**Alternative - union types**: For simpler cases, union types work well:
+
+```typescript
+type Status = 'pending' | 'active' | 'completed';
+```
+
+Use enums when you need to iterate over values or when the set is large and might change.
+
+## Generics: Writing Reusable Code
+
+Generics let you write code that works with multiple types while maintaining type safety.
+
+### The Problem Generics Solve
+
+Without generics, you'd need to write separate functions for each type or lose type information:
+
+```typescript
+// Without generics - loses type information
+function firstElement(arr: unknown[]): unknown {
+  return arr[0];
+}
+
+const first = firstElement([1, 2, 3]);
+// first is 'unknown' - we lost the fact that it's a number
+```
+
+### Generic Functions
+
+Generics preserve type information:
+
+```typescript
+// With generics - preserves type
+function firstElement<T>(arr: T[]): T | undefined {
+  return arr[0];
+}
+
+const first = firstElement([1, 2, 3]);
+// first is 'number | undefined' - TypeScript remembers the type
+
+const firstString = firstElement(['a', 'b', 'c']);
+// firstString is 'string | undefined'
+```
+
+The `<T>` declares a type parameter. Think of it as a placeholder that gets filled in when the function is called.
+
+### Generic Interfaces
+
+Useful for containers and wrappers:
+
+```typescript
+// Generic API response wrapper
+interface ApiResponse<T> {
+  data: T;
+  status: number;
+  message?: string;
+}
+
+// Usage with different types
+type UserResponse = ApiResponse<User>;
+type ArticleListResponse = ApiResponse<Article[]>;
+
+// Generic repository interface
 interface Repository<T> {
-  getById(id: string): Promise<T>;
-  getAll(): Promise<T[]>;
-  create(item: T): Promise<T>;
+  findById(id: string): Promise<T | null>;
+  findAll(): Promise<T[]>;
+  create(item: Omit<T, 'id'>): Promise<T>;
   update(id: string, item: Partial<T>): Promise<T>;
   delete(id: string): Promise<void>;
 }
+```
 
-// Generic constraint
+### Constraining Generics
+
+Sometimes you need to restrict what types can be used:
+
+```typescript
+// T must have an 'id' property
 interface HasId {
   id: string;
 }
@@ -248,77 +328,114 @@ function findById<T extends HasId>(items: T[], id: string): T | undefined {
   return items.find(item => item.id === id);
 }
 
-// Generic with multiple parameters
-interface KeyValuePair<K, V> {
-  key: K;
-  value: V;
-}
+// Works - User has id
+findById(users, '123');
+
+// TypeScript error - string[] doesn't have id property
+findById(['a', 'b'], '123');
 ```
 
-**Key Points**:
-- `<T>` declares a type parameter
-- `extends` constrains what types can be used
-- TypeScript often infers generic types automatically
+**When to use generics**: When you find yourself writing the same logic for different types, or when you need to preserve type information through a function.
 
-### Utility Types
+## Utility Types: Transforming Types
 
-Built-in types for common transformations.
+TypeScript provides built-in utility types for common transformations.
+
+### Partial<T> - Make All Properties Optional
+
+Use when you need to update some fields of an entity:
 
 ```typescript
 interface User {
   id: string;
   name: string;
   email: string;
-  password: string;
 }
 
-// Partial - all properties optional
-type UpdateUser = Partial<User>;
-// { id?: string; name?: string; email?: string; password?: string; }
+// All properties become optional
+type UserUpdate = Partial<User>;
+// Equivalent to: { id?: string; name?: string; email?: string; }
 
-// Required - all properties required
-type RequiredUser = Required<Partial<User>>;
-
-// Pick - select specific properties
-type UserPreview = Pick<User, 'id' | 'name'>;
-// { id: string; name: string; }
-
-// Omit - exclude specific properties
-type PublicUser = Omit<User, 'password'>;
-// { id: string; name: string; email: string; }
-
-// Record - create object type with specific key/value types
-type StatusMap = Record<string, boolean>;
-// { [key: string]: boolean }
-
-type UserById = Record<string, User>;
-// { [userId: string]: User }
-
-// Readonly - all properties readonly
-type ImmutableUser = Readonly<User>;
-
-// ReturnType - extract function return type
-function getUser() {
-  return { id: '1', name: 'Alice' };
+function updateUser(id: string, changes: Partial<User>): Promise<User> {
+  // Can pass any subset of User properties
 }
-type UserReturn = ReturnType<typeof getUser>;
-// { id: string; name: string; }
+
+updateUser('123', { name: 'New Name' }); // Valid
+updateUser('123', { email: 'new@example.com' }); // Valid
 ```
 
-### Type Guards
+### Pick<T, Keys> - Select Specific Properties
 
-Narrow types at runtime.
+Use when you only need certain fields:
 
 ```typescript
-// typeof guard
-function process(value: string | number): string {
-  if (typeof value === 'string') {
-    return value.toUpperCase(); // TypeScript knows it's string
-  }
-  return value.toFixed(2); // TypeScript knows it's number
-}
+// Only id and name
+type UserPreview = Pick<User, 'id' | 'name'>;
+// Equivalent to: { id: string; name: string; }
 
-// in operator guard
+// Useful for list views where you don't need all data
+function renderUserList(users: UserPreview[]): void {
+  users.forEach(user => console.log(user.name));
+}
+```
+
+### Omit<T, Keys> - Exclude Specific Properties
+
+Use when you need everything except certain fields:
+
+```typescript
+// Everything except id (server generates it)
+type CreateUserInput = Omit<User, 'id'>;
+// Equivalent to: { name: string; email: string; }
+
+// Exclude sensitive fields
+type PublicUser = Omit<User, 'password' | 'ssn'>;
+```
+
+### Record<Keys, Type> - Create Object Types
+
+Use when you need an object with specific keys:
+
+```typescript
+// Map of status to count
+type StatusCounts = Record<OrderStatus, number>;
+// Equivalent to: { pending: number; processing: number; ... }
+
+// Map of ID to entity
+type UserMap = Record<string, User>;
+
+// Useful for lookup tables
+const statusLabels: Record<OrderStatus, string> = {
+  [OrderStatus.Pending]: 'Waiting for processing',
+  [OrderStatus.Processing]: 'Being prepared',
+  // ... must include all statuses
+};
+```
+
+## Type Guards: Runtime Type Checking
+
+TypeScript's type system is compile-time only. Sometimes you need runtime checks.
+
+### The typeof Guard
+
+For primitive types:
+
+```typescript
+function formatValue(value: string | number): string {
+  if (typeof value === 'string') {
+    // TypeScript knows value is string here
+    return value.toUpperCase();
+  }
+  // TypeScript knows value is number here
+  return value.toFixed(2);
+}
+```
+
+### The in Operator
+
+For checking object properties:
+
+```typescript
 interface Dog {
   bark(): void;
 }
@@ -327,218 +444,128 @@ interface Cat {
   meow(): void;
 }
 
-function speak(animal: Dog | Cat): void {
+function makeSound(animal: Dog | Cat): void {
   if ('bark' in animal) {
     animal.bark(); // TypeScript knows it's Dog
   } else {
     animal.meow(); // TypeScript knows it's Cat
   }
 }
+```
 
-// Custom type guard
-interface ApiSuccess<T> {
-  data: T;
+### Custom Type Guards
+
+For complex type checking, write a type predicate:
+
+```typescript
+interface SuccessResponse {
+  data: unknown;
   error?: never;
 }
 
-interface ApiError {
+interface ErrorResponse {
   data?: never;
   error: string;
 }
 
-type ApiResult<T> = ApiSuccess<T> | ApiError;
+type ApiResult = SuccessResponse | ErrorResponse;
 
-function isSuccess<T>(result: ApiResult<T>): result is ApiSuccess<T> {
-  return result.data !== undefined;
+// Type predicate - returns 'result is SuccessResponse'
+function isSuccess(result: ApiResult): result is SuccessResponse {
+  return 'data' in result && result.data !== undefined;
 }
 
 // Usage
-const result: ApiResult<User> = await fetchUser();
+const result = await fetchData();
 if (isSuccess(result)) {
-  console.log(result.data.name); // TypeScript knows data exists
+  // TypeScript knows result.data exists
+  processData(result.data);
 } else {
-  console.error(result.error); // TypeScript knows error exists
+  // TypeScript knows result.error exists
+  showError(result.error);
 }
 ```
 
-## Module System
+## Module Organization
 
-### Exporting
+### Barrel Exports
+
+Group related types in a single import:
 
 ```typescript
-// Named exports
-export interface User {
-  id: string;
-  name: string;
-}
+// src/types/user.ts
+export interface User { ... }
+export interface CreateUserRequest { ... }
+export type UserRole = 'admin' | 'member' | 'guest';
 
-export function createUser(name: string): User {
-  return { id: crypto.randomUUID(), name };
-}
+// src/types/index.ts (barrel file)
+export * from './user';
+export * from './article';
+export * from './common';
 
-export const DEFAULT_USER: User = { id: '0', name: 'Guest' };
-
-// Default export
-export default class UserService {
-  getUser(id: string): Promise<User> {
-    // ...
-  }
-}
-
-// Re-export from another module
-export { ProductBrief, CreateBriefRequest } from './brief';
-export * from './api';
+// Usage - clean single import
+import { User, Article, ApiResponse } from '@/types';
 ```
 
-### Importing
+**Why barrel files?** They provide a stable public API. Internal file structure can change without affecting imports.
+
+### Type-Only Imports
+
+When importing only for type checking:
 
 ```typescript
-// Named imports
-import { User, createUser } from './user';
+// Removed at compile time - no runtime cost
+import type { User } from '@/types';
 
-// Default import
-import UserService from './user';
-
-// Combined
-import UserService, { User, createUser } from './user';
-
-// Rename import
-import { User as UserType } from './user';
-
-// Import all
-import * as UserModule from './user';
-
-// Type-only import (removed at compile time)
-import type { User } from './user';
-import { type User, createUser } from './user';
+// Mixed import
+import { createUser, type User } from '@/services/user';
 ```
 
-### Barrel Files
+**Why type-only imports?** They make dependencies clearer and can improve build performance.
 
-Re-export from a single entry point.
+## Configuration Philosophy
 
-```typescript
-// src/types/index.ts
-export * from './project';
-export * from './brief';
-export * from './api';
-
-// Usage
-import { Project, ProductBrief, ApiResponse } from '@/types';
-```
-
-## Declaration Files
-
-### CSS Modules Declaration
-
-```typescript
-// src/styles/cssModules.d.ts
-declare module '*.module.css' {
-  const classes: { [key: string]: string };
-  export default classes;
-}
-```
-
-### Environment Variables
-
-```typescript
-// src/vite-env.d.ts
-/// <reference types="vite/client" />
-
-interface ImportMetaEnv {
-  readonly VITE_API_URL: string;
-  readonly VITE_BUILD_VERSION: string;
-}
-
-interface ImportMeta {
-  readonly env: ImportMetaEnv;
-}
-```
-
-### Ambient Declarations
-
-```typescript
-// global.d.ts
-declare global {
-  interface Window {
-    analytics: {
-      track: (event: string, data?: Record<string, unknown>) => void;
-    };
-  }
-}
-
-export {}; // Makes this a module
-```
-
-## Configuration
-
-### tsconfig.json
+### Recommended tsconfig.json Settings
 
 ```json
 {
   "compilerOptions": {
-    "target": "ES2020",
-    "useDefineForClassFields": true,
-    "lib": ["ES2020", "DOM", "DOM.Iterable"],
-    "module": "ESNext",
-    "skipLibCheck": true,
-
-    /* Bundler mode */
-    "moduleResolution": "bundler",
-    "allowImportingTsExtensions": true,
-    "resolveJsonModule": true,
-    "isolatedModules": true,
-    "noEmit": true,
-    "jsx": "react-jsx",
-
-    /* Linting */
+    // Strict mode catches more bugs
     "strict": true,
+
+    // Catch unused code
     "noUnusedLocals": true,
     "noUnusedParameters": true,
-    "noFallthroughCasesInSwitch": true,
 
-    /* Path aliases */
-    "baseUrl": ".",
-    "paths": {
-      "@/*": ["./src/*"]
-    }
-  },
-  "include": ["src"],
-  "references": [{ "path": "./tsconfig.node.json" }]
+    // Ensure all code paths return
+    "noImplicitReturns": true,
+
+    // Catch fall-through in switch
+    "noFallthroughCasesInSwitch": true
+  }
 }
 ```
 
-### tsconfig.node.json
+**Why strict mode?** It enables all strict type checking options. While it requires more upfront effort, it catches significantly more bugs. New projects should always start with strict mode.
 
-For Vite configuration file.
+## Best Practices Summary
 
-```json
-{
-  "compilerOptions": {
-    "composite": true,
-    "skipLibCheck": true,
-    "module": "ESNext",
-    "moduleResolution": "bundler",
-    "allowSyntheticDefaultImports": true
-  },
-  "include": ["vite.config.ts"]
-}
-```
+### When Defining Types
 
-## Best Practices
+1. **Start with interfaces for domain entities** - They're extendable and clearly signal intent
+2. **Use type aliases for unions and computed types** - They're more flexible for complex type expressions
+3. **Separate request/response types from domain models** - API contracts should be explicit
+4. **Prefer string enums over numeric** - Better debugging and JSON serialization
 
-1. **Enable strict mode** - Use `"strict": true` in tsconfig
-2. **Prefer interfaces for objects** - Use `interface` for extendable shapes
-3. **Use type for unions** - `type Status = 'active' | 'inactive'`
-4. **Avoid `any`** - Use `unknown` when type is truly unknown
-5. **Use type-only imports** - `import type { User }` for types
-6. **Leverage inference** - Don't annotate obvious types
-7. **Define types near usage** - Co-locate types with related code
-8. **Export types from barrel files** - Centralize type exports
-9. **Use utility types** - `Partial`, `Pick`, `Omit` for transformations
-10. **Prefer string enums** - Better for debugging and serialization
-11. **Type function returns** - Explicit return types catch errors early
-12. **Use `readonly` for immutability** - Prevent accidental mutations
-13. **Document with JSDoc** - Add descriptions to exported types
-14. **Consistent naming** - `Interface` for interfaces, `Type` suffix optional
-15. **Handle null/undefined explicitly** - Use optional chaining and nullish coalescing
+### When Writing Code
+
+5. **Annotate function signatures, infer variables** - Functions are contracts; local variables are implementation details
+6. **Use generics when logic repeats across types** - Don't duplicate code for different types
+7. **Leverage utility types** - `Partial`, `Pick`, `Omit` solve common problems
+8. **Write type guards for runtime checking** - TypeScript can't check types at runtime without help
+
+### When Organizing Code
+
+9. **Use barrel files for public APIs** - Hide internal structure, provide clean imports
+10. **Use type-only imports where possible** - Clearer dependencies, better builds
+11. **Enable strict mode from the start** - Retrofitting is harder than starting strict
