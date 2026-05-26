@@ -8,9 +8,27 @@ This repository serves as a knowledge base documenting proven approaches and pat
 
 ## Contents
 
-- [React](./react.md) - React application architecture and patterns
+### Core Technologies
+
 - [JavaScript](./javascript.md) - JavaScript fundamentals and patterns
+- [TypeScript](./typescript.md) - TypeScript type system and patterns
+- [React](./react.md) - React application architecture and patterns
+- [Go](./golang.md) - Go API development with gorilla/mux
+
+### Infrastructure & Data
+
 - [Docker](./docker.md) - Docker containerization for frontend applications
+- [PostgreSQL](./postgres.md) - PostgreSQL database patterns and migrations
+
+### Complete Application Guides
+
+- [React Web App with Docker](./react-webapp-docker.md) - Full React + TypeScript + Vite + Docker guide
+- [Go API with PostgreSQL and Docker](./golang-api-postgres-docker.md) - Full Go + Mux + PostgreSQL + Docker guide
+
+### Specialized
+
+- [Vite + React Setup](./vite-react.md) - Vite configuration with React and TypeScript
+- [Unity 3D](./unity-3d.md) - Unity 3D project conventions
 
 ## Usage
 
